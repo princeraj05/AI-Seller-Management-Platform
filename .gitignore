@@ -11,17 +11,15 @@ frontend/node_modules/
 .env.production.local
 backend/.env
 frontend/.env
-*.json
-!package.json
-!package-lock.json
-!backend/package.json
-!backend/package-lock.json
-!frontend/package.json
-!frontend/package-lock.json
 
-# Firebase Admin Key
-*.json
+# Firebase Admin Key & Sensitive Credentials
 ai-seller-management-platform-firebase-adminsdk-*.json
+
+# Deployment Configs
+!vercel.json
+!frontend/vercel.json
+!render.yaml
+
 
 # Build outputs
 dist/
