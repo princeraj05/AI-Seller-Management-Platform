@@ -35,7 +35,7 @@ export const connectChannelService = async (tenant, connectData) => {
 
   const payload = {
     sellerId,
-    storeId,
+    storeId: storeId || null,
     provider: normProvider,
     type,
     status: 'CONNECTED',
@@ -51,10 +51,18 @@ export const connectChannelService = async (tenant, connectData) => {
   let connection = null;
 
   try {
-    connection = await ChannelConnection.create(payload);
+    // Upsert or create channel connection
+    connection = await ChannelConnection.findOneAndUpdate(
+      { sellerId, provider: normProvider },
+      payload,
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
   } catch (dbErr) {
     console.warn('DB connect channel failed/bypassed, using memory map:', dbErr.message);
-    const id = new mongoose.Types.ObjectId().toString();
+    const existing = Array.from(inMemoryChannelsMap.values()).find(
+      (c) => c.sellerId.toString() === sellerId.toString() && c.provider === normProvider
+    );
+    const id = existing ? existing._id : new mongoose.Types.ObjectId().toString();
     connection = {
       _id: id,
       id,
@@ -70,30 +78,57 @@ export const connectChannelService = async (tenant, connectData) => {
     const rawCredentials = credentials;
     const adapter = getChannelAdapter(normProvider, { credentials: rawCredentials });
     const testResult = await adapter.testConnection();
-    if (!testResult.success) {
-      connection.status = 'ERROR';
+    if (testResult.success) {
+      connection.status = 'CONNECTED';
+      connection.lastError = null;
+    } else {
+      connection.status = 'PENDING';
       connection.lastError = testResult.message;
     }
   } catch (adapterErr) {
-    connection.status = 'ERROR';
+    connection.status = 'PENDING';
     connection.lastError = adapterErr.message;
+  }
+
+  try {
+    if (typeof connection.save === 'function') {
+      await connection.save();
+    } else {
+      inMemoryChannelsMap.set(connection._id || connection.id, connection);
+    }
+  } catch (saveErr) {
+    inMemoryChannelsMap.set(connection._id || connection.id, connection);
   }
 
   return sanitizeChannelConnection(connection);
 };
 
 export const getChannelsService = async (sellerId, query = {}) => {
-  let channels = [];
+  let dbChannels = [];
   try {
-    channels = await ChannelConnection.find({ sellerId }).sort({ createdAt: -1 });
+    dbChannels = await ChannelConnection.find({ sellerId }).sort({ createdAt: -1 });
   } catch (err) {
     console.warn('DB fetch channels failed/bypassed:', err.message);
-    channels = Array.from(inMemoryChannelsMap.values()).filter(
-      (c) => c.sellerId.toString() === sellerId.toString()
-    );
   }
 
-  return channels.map(sanitizeChannelConnection);
+  const memChannels = Array.from(inMemoryChannelsMap.values()).filter(
+    (c) => c.sellerId && c.sellerId.toString() === sellerId.toString()
+  );
+
+  const channelMap = new Map();
+  dbChannels.forEach((c) => {
+    const id = c._id ? c._id.toString() : c.id;
+    channelMap.set(id, c);
+  });
+  memChannels.forEach((c) => {
+    const id = c._id ? c._id.toString() : c.id;
+    if (!channelMap.has(id)) {
+      channelMap.set(id, c);
+    }
+  });
+
+  const allChannels = Array.from(channelMap.values());
+  return allChannels.map(sanitizeChannelConnection);
 };
 
 export const getChannelByIdService = async (sellerId, channelId) => {

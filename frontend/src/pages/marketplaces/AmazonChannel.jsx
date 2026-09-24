@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, RefreshCw, CheckCircle2, AlertCircle, XCircle, LogOut, PlusCircle } from 'lucide-react';
+import { ArrowLeft, RefreshCw, CheckCircle2, AlertCircle, XCircle, LogOut, PlusCircle, Clock } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { getChannelsApi, syncChannelApi, disconnectChannelApi, connectChannelApi } from '../../services/channelService';
 
@@ -16,7 +16,7 @@ export default function AmazonChannel() {
     try {
       const res = await getChannelsApi();
       if (res && res.data && Array.isArray(res.data.channels)) {
-        const conn = res.data.channels.find((c) => c.provider === 'AMAZON' && c.status === 'CONNECTED');
+        const conn = res.data.channels.find((c) => c.provider === 'AMAZON');
         setConnection(conn || null);
       } else {
         setConnection(null);
@@ -76,12 +76,29 @@ export default function AmazonChannel() {
     setMessage(null);
     setActionLoading(true);
     try {
-      await connectChannelApi('AMAZON', {
+      const res = await connectChannelApi('AMAZON', {
         displayName: formData.displayName || 'Amazon Seller Account',
         externalAccountId: formData.externalAccountId,
         credentials: { refreshToken: 'sample-refresh-token' },
       });
-      setMessage({ type: 'success', text: 'Amazon account connected successfully!' });
+
+      const createdConn = res?.data?.channel || res?.channel;
+      if (createdConn && createdConn.status === 'CONNECTED') {
+        setMessage({ type: 'success', text: 'Amazon account connected & verified successfully!' });
+      } else if (createdConn && createdConn.status === 'PENDING') {
+        setMessage({
+          type: 'info',
+          text: createdConn.lastError || 'Amazon Seller ID registered. Seller Central LWA authorization required to activate sync.',
+        });
+      } else if (createdConn && createdConn.status === 'ERROR') {
+        setMessage({
+          type: 'error',
+          text: createdConn.lastError || 'Amazon SP-API verification failed. Please verify credentials.',
+        });
+      } else {
+        setMessage({ type: 'success', text: 'Amazon connection setup saved.' });
+      }
+
       setShowConnectModal(false);
       await fetchConnection();
     } catch (err) {
@@ -92,6 +109,8 @@ export default function AmazonChannel() {
   };
 
   const isConnected = connection && connection.status === 'CONNECTED';
+  const isPending = connection && connection.status === 'PENDING';
+  const isError = connection && connection.status === 'ERROR';
 
   return (
     <div className="space-y-6 font-sans text-xs">
@@ -122,7 +141,7 @@ export default function AmazonChannel() {
               onClick={() => setShowConnectModal(true)}
               className="bg-amber-500 hover:bg-amber-600 text-white font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
             >
-              <PlusCircle className="w-4 h-4" /> Connect Amazon Account
+              <PlusCircle className="w-4 h-4" /> {connection ? 'Manage Setup' : 'Connect Amazon Account'}
             </button>
           )}
         </div>
@@ -131,10 +150,20 @@ export default function AmazonChannel() {
       {message && (
         <div
           className={`p-3 rounded-lg flex items-center gap-2 ${
-            message.type === 'error' ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+            message.type === 'error'
+              ? 'bg-rose-50 text-rose-700 border border-rose-200'
+              : message.type === 'info'
+              ? 'bg-amber-50 text-amber-800 border border-amber-200'
+              : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
           }`}
         >
-          {message.type === 'error' ? <AlertCircle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+          {message.type === 'error' ? (
+            <AlertCircle className="w-4 h-4" />
+          ) : message.type === 'info' ? (
+            <Clock className="w-4 h-4" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4" />
+          )}
           {message.text}
         </div>
       )}
@@ -151,12 +180,24 @@ export default function AmazonChannel() {
                 ? `Seller ID: ${connection.externalAccountId || 'Connected'} • Connected since ${
                     connection.createdAt ? new Date(connection.createdAt).toLocaleDateString() : 'Active'
                   }`
+                : isPending
+                ? `Seller ID: ${connection.externalAccountId || 'Registered'} • Awaiting Authorization`
+                : isError
+                ? `Seller ID: ${connection.externalAccountId || 'Error'} • Connection Error`
                 : 'Amazon Seller Account • Not Connected'}
             </p>
           </div>
           {isConnected ? (
             <span className="ml-auto bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
               <CheckCircle2 className="w-3.5 h-3.5" /> Connected & Active
+            </span>
+          ) : isPending ? (
+            <span className="ml-auto bg-amber-100 text-amber-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+              <Clock className="w-3.5 h-3.5" /> Pending Authorization
+            </span>
+          ) : isError ? (
+            <span className="ml-auto bg-rose-100 text-rose-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+              <AlertCircle className="w-3.5 h-3.5" /> Connection Error
             </span>
           ) : (
             <span className="ml-auto bg-slate-100 text-slate-600 px-3 py-1 rounded-full font-bold flex items-center gap-1">
@@ -195,16 +236,20 @@ export default function AmazonChannel() {
         {!isConnected && (
           <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col md:flex-row items-center justify-between gap-4 mt-4">
             <div>
-              <h3 className="font-bold text-amber-900">Connect Your Amazon Seller Central Account</h3>
+              <h3 className="font-bold text-amber-900">
+                {isPending ? 'Seller Central Authorization Pending' : 'Connect Your Amazon Seller Central Account'}
+              </h3>
               <p className="text-amber-700 text-xs mt-0.5">
-                Link your Amazon SP-API account to sync inventory, prices, and orders automatically.
+                {isPending
+                  ? connection.lastError || 'Seller ID is registered. Complete Amazon SP-API OAuth / LWA token authorization to enable live sync.'
+                  : 'Link your Amazon SP-API account to sync inventory, prices, and orders automatically.'}
               </p>
             </div>
             <button
               onClick={() => setShowConnectModal(true)}
               className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-4 py-2 rounded-lg whitespace-nowrap shadow-sm"
             >
-              Start Connection Setup
+              {isPending ? 'Update Credentials' : 'Start Connection Setup'}
             </button>
           </div>
         )}
@@ -260,4 +305,5 @@ export default function AmazonChannel() {
     </div>
   );
 }
+
 

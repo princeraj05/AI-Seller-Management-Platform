@@ -3,15 +3,13 @@ import mongoose from 'mongoose';
 const channelConnectionSchema = new mongoose.Schema(
   {
     sellerId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type: mongoose.Schema.Types.Mixed,
       required: true,
       index: true,
     },
     storeId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Store',
-      required: true,
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
       index: true,
     },
     provider: {
