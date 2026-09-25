@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw, CheckCircle2, ArrowRight, AlertCircle, XCircle } from 'lucide-react';
+import { RefreshCw, CheckCircle2, ArrowRight, AlertCircle, XCircle, Clock } from 'lucide-react';
 import { getChannelsApi, syncChannelApi } from '../../services/channelService';
 
 const SUPPORTED_CHANNELS = [
@@ -141,6 +141,7 @@ export default function AllChannels() {
         {mappedChannels.map((ch) => {
           const initial = ch.name ? ch.name[0].toUpperCase() : 'C';
           const isConnected = ch.status === 'CONNECTED';
+          const isPending = ch.status === 'PENDING';
 
           return (
             <div key={ch.id} className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-4">
@@ -151,15 +152,17 @@ export default function AllChannels() {
                   </div>
                   <div>
                     <h3 className="font-bold text-slate-900">{ch.name}</h3>
-                    <span className={`text-[10px] font-semibold flex items-center gap-1 ${isConnected ? 'text-emerald-600' : ch.isError ? 'text-rose-600' : 'text-slate-400'}`}>
+                    <span className={`text-[10px] font-semibold flex items-center gap-1 ${isConnected ? 'text-emerald-600' : isPending ? 'text-amber-600' : ch.isError ? 'text-rose-600' : 'text-slate-400'}`}>
                       {isConnected ? (
                         <CheckCircle2 className="w-3 h-3 inline" />
+                      ) : isPending ? (
+                        <Clock className="w-3 h-3 inline text-amber-600" />
                       ) : ch.isError ? (
                         <AlertCircle className="w-3 h-3 inline" />
                       ) : (
                         <XCircle className="w-3 h-3 inline text-slate-400" />
                       )}
-                      {isConnected ? 'Connected' : ch.isError ? ch.status : 'Not Connected'}
+                      {isConnected ? 'Connected' : isPending ? 'Pending Auth' : ch.isError ? ch.status : 'Not Connected'}
                     </span>
                   </div>
                 </div>

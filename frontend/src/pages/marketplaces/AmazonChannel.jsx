@@ -69,7 +69,7 @@ export default function AmazonChannel() {
 
   const handleConnectSubmit = async (e) => {
     e.preventDefault();
-    if (!formData.externalAccountId) {
+    if (!formData.externalAccountId || !formData.externalAccountId.trim()) {
       setMessage({ type: 'error', text: 'Please enter a valid Seller ID.' });
       return;
     }
@@ -78,8 +78,8 @@ export default function AmazonChannel() {
     try {
       const res = await connectChannelApi('AMAZON', {
         displayName: formData.displayName || 'Amazon Seller Account',
-        externalAccountId: formData.externalAccountId,
-        credentials: { refreshToken: 'sample-refresh-token' },
+        externalAccountId: formData.externalAccountId.trim(),
+        credentials: { sellerId: formData.externalAccountId.trim() },
       });
 
       const createdConn = res?.data?.channel || res?.channel;
@@ -88,7 +88,7 @@ export default function AmazonChannel() {
       } else if (createdConn && createdConn.status === 'PENDING') {
         setMessage({
           type: 'info',
-          text: createdConn.lastError || 'Amazon Seller ID registered. Seller Central LWA authorization required to activate sync.',
+          text: createdConn.lastError || 'Amazon Seller ID registered. Amazon SP-API authorization required to activate sync.',
         });
       } else if (createdConn && createdConn.status === 'ERROR') {
         setMessage({
@@ -96,7 +96,7 @@ export default function AmazonChannel() {
           text: createdConn.lastError || 'Amazon SP-API verification failed. Please verify credentials.',
         });
       } else {
-        setMessage({ type: 'success', text: 'Amazon connection setup saved.' });
+        setMessage({ type: 'info', text: 'Amazon connection setup saved. Authorization pending.' });
       }
 
       setShowConnectModal(false);
@@ -158,24 +158,24 @@ export default function AmazonChannel() {
           }`}
         >
           {message.type === 'error' ? (
-            <AlertCircle className="w-4 h-4" />
+            <AlertCircle className="w-4 h-4 shrink-0" />
           ) : message.type === 'info' ? (
-            <Clock className="w-4 h-4" />
+            <Clock className="w-4 h-4 shrink-0" />
           ) : (
-            <CheckCircle2 className="w-4 h-4" />
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
           )}
-          {message.text}
+          <span>{message.text}</span>
         </div>
       )}
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
         <div className="flex items-center gap-3 border-b border-slate-100 pb-4">
-          <div className="w-12 h-12 rounded-xl bg-amber-500 text-white font-extrabold text-xl flex items-center justify-center">
+          <div className="w-12 h-12 rounded-xl bg-amber-500 text-white font-extrabold text-xl flex items-center justify-center shrink-0">
             A
           </div>
-          <div>
-            <h1 className="text-xl font-bold text-slate-900">Amazon Seller Account</h1>
-            <p className="text-slate-500">
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold text-slate-900 truncate">Amazon Seller Account</h1>
+            <p className="text-slate-500 truncate">
               {isConnected
                 ? `Seller ID: ${connection.externalAccountId || 'Connected'} • Connected since ${
                     connection.createdAt ? new Date(connection.createdAt).toLocaleDateString() : 'Active'
@@ -188,19 +188,19 @@ export default function AmazonChannel() {
             </p>
           </div>
           {isConnected ? (
-            <span className="ml-auto bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+            <span className="ml-auto bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
               <CheckCircle2 className="w-3.5 h-3.5" /> Connected & Active
             </span>
           ) : isPending ? (
-            <span className="ml-auto bg-amber-100 text-amber-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+            <span className="ml-auto bg-amber-100 text-amber-700 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
               <Clock className="w-3.5 h-3.5" /> Pending Authorization
             </span>
           ) : isError ? (
-            <span className="ml-auto bg-rose-100 text-rose-700 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+            <span className="ml-auto bg-rose-100 text-rose-700 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
               <AlertCircle className="w-3.5 h-3.5" /> Connection Error
             </span>
           ) : (
-            <span className="ml-auto bg-slate-100 text-slate-600 px-3 py-1 rounded-full font-bold flex items-center gap-1">
+            <span className="ml-auto bg-slate-100 text-slate-600 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
               <XCircle className="w-3.5 h-3.5" /> Not Connected
             </span>
           )}
@@ -247,7 +247,7 @@ export default function AmazonChannel() {
             </div>
             <button
               onClick={() => setShowConnectModal(true)}
-              className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-4 py-2 rounded-lg whitespace-nowrap shadow-sm"
+              className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-4 py-2 rounded-lg whitespace-nowrap shadow-sm shrink-0"
             >
               {isPending ? 'Update Credentials' : 'Start Connection Setup'}
             </button>
@@ -256,9 +256,9 @@ export default function AmazonChannel() {
       </div>
 
       {showConnectModal && (
-        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl space-y-4">
-            <h2 className="text-lg font-bold text-slate-900">Connect Amazon Seller Central</h2>
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50 overflow-x-hidden">
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto p-4 sm:p-6 shadow-xl space-y-4">
+            <h2 className="text-lg font-bold text-slate-900 break-words">Connect Amazon Seller Central</h2>
             <form onSubmit={handleConnectSubmit} className="space-y-4">
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Display Name</label>
@@ -266,7 +266,7 @@ export default function AmazonChannel() {
                   type="text"
                   value={formData.displayName}
                   onChange={(e) => setFormData({ ...formData, displayName: e.target.value })}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs"
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
                   placeholder="e.g. Amazon India Store"
                   required
                 />
@@ -277,25 +277,33 @@ export default function AmazonChannel() {
                   type="text"
                   value={formData.externalAccountId}
                   onChange={(e) => setFormData({ ...formData, externalAccountId: e.target.value })}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs"
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
                   placeholder="e.g. A3QW12EXAMPLE"
                   required
                 />
               </div>
-              <div className="flex justify-end gap-2 pt-2">
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-2">
                 <button
                   type="button"
                   onClick={() => setShowConnectModal(false)}
-                  className="px-4 py-2 border border-slate-200 rounded-lg text-slate-600 font-semibold"
+                  disabled={actionLoading}
+                  className="w-full sm:w-auto px-4 py-2 border border-slate-200 rounded-lg text-slate-600 font-semibold hover:bg-slate-50 transition-colors text-xs disabled:opacity-50"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={actionLoading}
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-semibold disabled:opacity-50"
+                  className="w-full sm:w-auto px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-semibold shadow-sm transition-colors text-xs disabled:opacity-50 flex items-center justify-center gap-1.5"
                 >
-                  {actionLoading ? 'Connecting...' : 'Authorize & Connect'}
+                  {actionLoading ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      Connecting...
+                    </>
+                  ) : (
+                    'Authorize & Connect'
+                  )}
                 </button>
               </div>
             </form>

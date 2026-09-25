@@ -10,6 +10,15 @@ export const inMemoryChannelsMap = new Map();
 export const inMemorySyncHistoryMap = new Map();
 export const inMemoryListingsMap = new Map();
 
+const withDbTimeout = (promise, ms = 3000) => {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Database operation timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+};
+
 /**
  * Sanitize channel connection object so secrets are NEVER returned to frontend
  */
@@ -51,11 +60,14 @@ export const connectChannelService = async (tenant, connectData) => {
   let connection = null;
 
   try {
-    // Upsert or create channel connection
-    connection = await ChannelConnection.findOneAndUpdate(
-      { sellerId, provider: normProvider },
-      payload,
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+    // Upsert or create channel connection with DB timeout
+    connection = await withDbTimeout(
+      ChannelConnection.findOneAndUpdate(
+        { sellerId, provider: normProvider },
+        payload,
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ),
+      3000
     );
   } catch (dbErr) {
     console.warn('DB connect channel failed/bypassed, using memory map:', dbErr.message);
@@ -92,7 +104,7 @@ export const connectChannelService = async (tenant, connectData) => {
 
   try {
     if (typeof connection.save === 'function') {
-      await connection.save();
+      await withDbTimeout(connection.save(), 3000);
     } else {
       inMemoryChannelsMap.set(connection._id || connection.id, connection);
     }
@@ -106,7 +118,7 @@ export const connectChannelService = async (tenant, connectData) => {
 export const getChannelsService = async (sellerId, query = {}) => {
   let dbChannels = [];
   try {
-    dbChannels = await ChannelConnection.find({ sellerId }).sort({ createdAt: -1 });
+    dbChannels = await withDbTimeout(ChannelConnection.find({ sellerId }).sort({ createdAt: -1 }), 3000);
   } catch (err) {
     console.warn('DB fetch channels failed/bypassed:', err.message);
   }
