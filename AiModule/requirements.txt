@@ -1,14 +1,24 @@
 ﻿# Core Web Framework & ASGI Server
 fastapi>=0.110.0,<1.0.0
 uvicorn[standard]>=0.28.0,<1.0.0
+python-multipart>=0.0.9
 
 # Settings & Validation
 pydantic>=2.6.4,<3.0.0
 pydantic-settings>=2.2.1,<3.0.0
 
-# Asynchronous HTTP Client for Node.js Backend Integration
+# Asynchronous HTTP Client for Node.js Backend & Ollama Integration
 httpx>=0.27.0,<1.0.0
+
+# Image Processing, Numerical Arrays & Computer Vision Foundation
+Pillow>=10.0.0
+numpy>=1.24.0
 
 # Testing Suite
 pytest>=8.0.0,<9.0.0
 pytest-asyncio>=0.23.5,<1.0.0
+
+# Optional OCR Engine:
+# When ready for live OCR model execution, install:
+# paddleocr>=2.7.0
+# paddlepaddle>=2.5.0

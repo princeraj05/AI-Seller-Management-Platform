@@ -3,7 +3,7 @@ Centralized Configuration Management using Pydantic Settings.
 Environment variables are strictly parsed, validated, and sanitized.
 """
 from functools import lru_cache
-from typing import Optional
+from typing import List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -37,11 +37,30 @@ class Settings(BaseSettings):
     NODE_BACKEND_URL: str = Field(default="http://localhost:5000", description="Base URL of Node.js backend")
     NODE_BACKEND_TIMEOUT: float = Field(default=15.0, description="Timeout in seconds for Node.js requests")
 
-    # Future AI Model Provider Settings (Optional for Phase 01)
+    # Phase 02: Computer Vision Model Provider Settings
+    VISION_MODEL_PROVIDER: str = Field(default="ollama", description="Vision provider: ollama or gemini")
+    VISION_MODEL_NAME: str = Field(default="qwen2.5-vl:7b", description="Default Vision-Language model name")
+    VISION_REQUEST_TIMEOUT: float = Field(default=60.0, description="Vision inference request timeout in seconds")
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", description="Ollama server base URL")
-    OLLAMA_MODEL: str = Field(default="qwen2.5-vl:7b", description="Default Vision-Language model name")
+    OLLAMA_MODEL: str = Field(default="qwen2.5-vl:7b", description="Fallback Ollama model name")
+
+    # Cloud AI Provider (Optional Fallback)
     GEMINI_API_KEY: Optional[str] = Field(default=None, description="Optional Google Gemini API key")
     GEMINI_MODEL: str = Field(default="gemini-1.5-flash", description="Default Gemini model name")
+
+    # Phase 02: OCR Engine Settings
+    OCR_ENABLED: bool = Field(default=True, description="Enable or disable OCR text extraction")
+    OCR_LANGUAGE: str = Field(default="en", description="OCR language code (e.g., en, ch, etc.)")
+
+    # Phase 02: Image Processing & Validation Limits
+    IMAGE_MAX_SIZE_MB: int = Field(default=10, description="Maximum allowed uploaded image file size in Megabytes")
+    IMAGE_MAX_WIDTH: int = Field(default=4096, description="Maximum allowed width in pixels")
+    IMAGE_MAX_HEIGHT: int = Field(default=4096, description="Maximum allowed height in pixels")
+    IMAGE_MAX_DIMENSION: int = Field(default=1536, description="Target downsampling dimension for model inputs")
+    IMAGE_ALLOWED_FORMATS: List[str] = Field(
+        default=["JPEG", "JPG", "PNG", "WEBP"],
+        description="Allowed image file formats"
+    )
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -55,7 +74,6 @@ class Settings(BaseSettings):
     @field_validator("AI_SERVICE_SECRET")
     @classmethod
     def validate_service_secret(cls, v: str, info) -> str:
-        # In production, enforce minimum 32 chars and disallow the default dev secret
         env = info.data.get("APP_ENV", "development")
         if env == "production":
             if not v or v == "dev_internal_ai_service_secret_key_change_in_production_32b":
@@ -81,7 +99,7 @@ class Settings(BaseSettings):
         return (
             f"<Settings app_name='{self.APP_NAME}' env='{self.APP_ENV}' "
             f"port={self.PORT} node_url='{self.NODE_BACKEND_URL}' "
-            f"gemini_configured={self.is_gemini_configured}>"
+            f"vision_model='{self.VISION_MODEL_NAME}' ocr_enabled={self.OCR_ENABLED}>"
         )
 
 

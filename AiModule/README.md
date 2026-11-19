@@ -1,4 +1,4 @@
-﻿# Bhartiye Crafts — Python AI/ML Microservice
+# Bhartiye Crafts — Python AI/ML Microservice
 
 Welcome to the independent AI/ML microservice for the **Bhartiye Crafts AI Seller Management Platform**.
 
@@ -223,26 +223,117 @@ Headers:
 
 ---
 
-## 9. Running Automated Tests
+## 9. Phase 02 — Computer Vision, OCR & Product Intelligence Engine
+
+Phase 02 equips the microservice with vision-language multimodal analysis, optical character recognition (OCR), and structured attribute normalization specifically calibrated for Indian handicraft products.
+
+### Features
+* **Multimodal Vision Understanding**: Powered by Ollama (`qwen2.5-vl:7b` or `qwen3-vl:8b`), analyzing textures, handcrafted indicators, colors, materials, and multiple products in image.
+* **Optical Character Recognition (OCR)**: PaddleOCR integration with lazy-loading execution, extracting text segments, brand markings, certifications, and dimensions.
+* **Image Validation & Optimization**: Magic byte validation, decompression bomb safeguards (`MAX_IMAGE_PIXELS = 100_000_000`), EXIF orientation correction, RGBA-to-RGB conversion, Lanczos downsampling.
+* **Confidence & Evidence Calibration**: Factual observation vs. reasonable inference categorization (e.g. materials from texture are marked inference; observed colors are marked confirmed).
+* **Handicraft Category Taxonomy**: Deterministic prediction across Home Decor, Fashion & Apparel, Jewelry, Kitchen & Dining, Textiles.
+
+### Setup Instructions
+
+#### 1. Ollama Vision Model Setup
+```bash
+# Install and run Ollama from https://ollama.com
+ollama run qwen2.5-vl:7b
+# Or for higher capability when available:
+# ollama run qwen3-vl:8b
+```
+
+#### 2. Optional PaddleOCR Setup
+```bash
+# If running locally with native C++ build tools (optional):
+pip install paddlepaddle paddleocr
+```
+*Note: If PaddleOCR is omitted, the microservice gracefully degrades without crashing and sets OCR status to `unavailable`.*
+
+### API Endpoints
+
+#### `POST /api/v1/vision/extract-attributes`
+Extracts structured handicraft product intelligence from an uploaded image.
+
+* **Headers**:
+  * `X-Internal-Service-Key`: Internal microservice shared secret.
+  * `X-Seller-ID`: Authenticated seller identifier.
+* **Form-Data**:
+  * `file`: Product image (JPEG, PNG, WEBP, max 10MB).
+  * `enable_ocr`: Boolean (default `true`).
+  * `user_hint`: Optional seller hint (e.g., `"Handmade terracotta vase"`).
+
+**Sample Response**:
+```json
+{
+  "success": true,
+  "data": {
+    "title_suggestion": "Handcrafted Terracotta Clay Flower Vase",
+    "category": {
+      "primary_category": "Home Decor",
+      "sub_category": "Vases & Planters",
+      "confidence": 0.90
+    },
+    "attributes": [
+      {
+        "name": "primary_material",
+        "value": "Terracotta",
+        "confidence": 0.82,
+        "evidence_source": "vision_model",
+        "uncertainty_status": "reasonable_inference",
+        "notes": "Earthy reddish-brown unglazed ceramic texture"
+      }
+    ],
+    "ocr_result": {
+      "status": "success",
+      "detected_text": "BHARTIYE CRAFTS",
+      "segments": [
+        {"text": "BHARTIYE CRAFTS", "confidence": 0.95}
+      ]
+    },
+    "multiple_products_detected": false,
+    "confidence_score": 0.88,
+    "image_metadata": {
+      "filename": "vase.jpg",
+      "format": "JPEG",
+      "width": 1200,
+      "height": 1200
+    }
+  }
+}
+```
+
+#### `GET /api/v1/vision/status`
+Checks health and availability of the Vision Model (Ollama) and OCR Engine.
+
+---
+
+## 10. Running Automated Tests
 
 ```bash
 # Run pytest from inside AiModule
 python -m pytest -v
 ```
 
-The test suite covers:
-* Application startup & ASGI lifespan
+The test suite includes **44 automated tests** covering:
+* Core application startup & ASGI lifespan
 * Liveness (`/health`) and readiness (`/health/ready`) probes
 * Pydantic configuration validation & production security checks
 * Internal service authentication & tenant context extraction
 * Node.js HTTP client requests, mock transport, timeouts, and error handling
+* Image validation, corruption handling, and preprocessing
+* Ollama vision client parsing, timeout handling, and fallback behavior
+* PaddleOCR lazy loading, success parsing, and graceful degradation
+* Product intelligence orchestration, category taxonomy, and multi-product flagging
+* End-to-end Vision API endpoints (`/api/v1/vision/*`)
 
 ---
 
-## 10. Planned Future Modules
+## 11. Planned Future Modules
 
-* **Phase 02**: Vision, OCR & Product Intelligence Engine (Qwen3-VL / Ollama, PaddleOCR, attribute extraction)
 * **Phase 03**: Multi-Channel Listing & Schema Generator (Amazon SP-API, Flipkart, Meesho)
 * **Phase 04**: RAG Knowledge Engine (MongoDB Atlas Vector Search, Sentence Transformers)
 * **Phase 05**: Conversational AI Seller Assistant with Tool Calling
 * **Phase 06**: Business Intelligence, Trend Analysis & Automated Reports
+
