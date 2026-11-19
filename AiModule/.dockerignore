@@ -1,0 +1,16 @@
+﻿.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+.git
+.gitignore
+.env
+tests
+*.md
+Bhartiye_Crafts_AI_ML_Module_Overview.pdf
