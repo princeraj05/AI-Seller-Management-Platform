@@ -147,9 +147,8 @@ export default function AIStudioOverview() {
         attributes: draftAttributes,
         keywords: draftKeywords,
         tags: draftTags,
-        images: [
-          'https://images.unsplash.com/photo-1583391733956-6c78276477e2?w=500'
-        ],
+        // No stock image: seller uploads real photos via Edit Product
+        images: [],
         seo: draftSeo,
         aiGenerated: true,
         aiApproved: true,

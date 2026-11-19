@@ -20,8 +20,9 @@ export default function AllChannels() {
     setLoading(true);
     try {
       const res = await getChannelsApi();
-      if (res && res.data && Array.isArray(res.data.channels)) {
-        setDbConnections(res.data.channels);
+      const channelsList = res?.channels || res?.data?.channels;
+      if (Array.isArray(channelsList)) {
+        setDbConnections(channelsList);
       } else {
         setDbConnections([]);
       }

@@ -37,3 +37,7 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# Local Uploads & Migration Backups
+backend/uploads/
+backend/migration_backups/

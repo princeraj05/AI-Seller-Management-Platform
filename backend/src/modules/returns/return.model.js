@@ -3,13 +3,14 @@ import mongoose from 'mongoose';
 const returnItemSchema = new mongoose.Schema(
   {
     sku: { type: String, required: true },
+    asin: { type: String, default: '' },
+    title: { type: String, default: '' },
     productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
     variantId: { type: mongoose.Schema.Types.ObjectId },
     quantity: { type: Number, required: true, min: 1 },
     reason: { type: String, default: 'Customer Return' },
     condition: {
       type: String,
-      enum: ['NEW', 'OPEN_BOX', 'DAMAGED', 'DEFECTIVE'],
       default: 'NEW',
     },
     inspectionStatus: {
@@ -19,7 +20,6 @@ const returnItemSchema = new mongoose.Schema(
     },
     disposition: {
       type: String,
-      enum: ['RESTOCK', 'DAMAGED', 'DISPOSED', 'PENDING_INSPECTION'],
       default: 'PENDING_INSPECTION',
     },
     restockedQuantity: { type: Number, default: 0 },
@@ -30,16 +30,23 @@ const returnItemSchema = new mongoose.Schema(
 const returnSchema = new mongoose.Schema(
   {
     sellerId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type: mongoose.Schema.Types.Mixed,
       required: true,
       index: true,
     },
     storeId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Store',
-      required: true,
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
       index: true,
+    },
+    channelId: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+      index: true,
+    },
+    marketplaceId: {
+      type: String,
+      default: 'A21TJRUUN4KGV',
     },
     rmaNumber: {
       type: String,
@@ -47,31 +54,44 @@ const returnSchema = new mongoose.Schema(
       unique: true,
     },
     orderId: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: mongoose.Schema.Types.Mixed,
       ref: 'Order',
     },
     externalOrderId: {
       type: String,
+      index: true,
     },
     channel: {
       type: String,
-      enum: ['AMAZON', 'FLIPKART', 'MYNTRA', 'SHOPIFY', 'WOOCOMMERCE', 'WIX', 'CUSTOM_WEBSITE', 'POS'],
+      enum: ['AMAZON', 'FLIPKART', 'MYNTRA', 'SHOPIFY', 'WOOCOMMERCE', 'WIX', 'CUSTOM_WEBSITE', 'POS', 'Amazon', 'Flipkart', 'Myntra'],
       required: true,
     },
     items: [returnItemSchema],
     status: {
       type: String,
-      enum: ['REQUESTED', 'APPROVED', 'REJECTED', 'RECEIVED', 'INSPECTED', 'COMPLETED', 'CANCELLED'],
+      enum: ['REQUESTED', 'APPROVED', 'REJECTED', 'RECEIVED', 'INSPECTED', 'COMPLETED', 'CANCELLED', 'RETURNED', 'REFUNDED'],
       default: 'REQUESTED',
     },
     refundStatus: {
       type: String,
-      enum: ['NOT_APPLICABLE', 'PENDING', 'PROCESSED', 'FAILED'],
+      enum: ['NOT_APPLICABLE', 'PENDING', 'PROCESSED', 'FAILED', 'REFUNDED', 'PARTIAL', 'FULL'],
       default: 'PENDING',
     },
     refundAmount: {
       type: Number,
       default: 0,
+    },
+    refundDate: {
+      type: Date,
+      default: null,
+    },
+    source: {
+      type: String,
+      default: 'AMAZON',
+    },
+    sourceMetadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
     customerNote: {
       type: String,

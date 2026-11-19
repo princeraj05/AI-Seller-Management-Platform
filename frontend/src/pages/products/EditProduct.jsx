@@ -1,7 +1,23 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { ArrowLeft, Sparkles, Save, RefreshCw, AlertCircle } from 'lucide-react';
-import { getProductByIdApi, updateProductApi } from '../../services/productService';
+import {
+  ArrowLeft,
+  Sparkles,
+  Save,
+  RefreshCw,
+  AlertCircle,
+  Upload,
+  Trash2,
+  Star,
+  Plus,
+  CheckCircle2,
+  MoveLeft,
+  MoveRight,
+  Image as ImageIcon,
+} from 'lucide-react';
+import { getProductByIdApi, updateProductApi, uploadProductImageApi } from '../../services/productService';
+import { isLocalDevImage } from '../../utils/imageUrl';
+import ProductImage from '../../components/common/ProductImage';
 
 export default function EditProduct() {
   const { id } = useParams();
@@ -21,6 +37,12 @@ export default function EditProduct() {
   const [category, setCategory] = useState('');
   const [suggestedTitle, setSuggestedTitle] = useState('');
 
+  // Images state
+  const [images, setImages] = useState([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [imageError, setImageError] = useState(null);
+  const fileInputRef = useRef(null);
+
   const fetchProduct = async () => {
     setLoading(true);
     setError(null);
@@ -35,6 +57,23 @@ export default function EditProduct() {
         setSku(item.sku || '');
         setBrand(item.brand || 'Bhartiye Crafts');
         setCategory(item.categoryName || item.category || 'Fashion');
+
+        const rawImgs = Array.isArray(item.images) ? item.images : [];
+        setImages(
+          rawImgs.map((img, i) => {
+            // Keep the stored value untouched; resolution happens only at render time
+            const url = typeof img === 'string' ? img : (img?.secure_url || img?.url || '');
+            return {
+              id: `existing_${i}_${Date.now()}`,
+              url,
+              secure_url: url,
+              name: `Image ${i + 1}`,
+              size: 0,
+              isUploading: false,
+              error: null,
+            };
+          })
+        );
       } else {
         setError('Product not found.');
       }
@@ -53,6 +92,117 @@ export default function EditProduct() {
     setSuggestedTitle(`${brand || 'Bhartiye Crafts'} Premium ${name || 'Item'} | Handcrafted & Authentic`);
   };
 
+  const uploadSingleImage = async (file, tempId) => {
+    try {
+      const reader = new FileReader();
+      const base64Promise = new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = (err) => reject(err);
+      });
+      reader.readAsDataURL(file);
+      const base64Data = await base64Promise;
+
+      const uploadRes = await uploadProductImageApi({
+        image: base64Data,
+        fileName: file.name,
+        mimeType: file.type,
+      });
+
+      const finalUploadedUrl = uploadRes?.data?.secure_url || uploadRes?.data?.url || uploadRes?.data?.local_url;
+      if (uploadRes && uploadRes.success && finalUploadedUrl) {
+        setImages((prev) =>
+          prev.map((item) =>
+            item.id === tempId
+              ? {
+                  ...item,
+                  url: finalUploadedUrl,
+                  secure_url: finalUploadedUrl,
+                  public_id: uploadRes.data.public_id,
+                  isUploading: false,
+                  error: null,
+                }
+              : item
+          )
+        );
+      } else {
+        throw new Error(uploadRes?.message || 'Upload failed');
+      }
+    } catch (err) {
+      setImages((prev) =>
+        prev.map((item) =>
+          item.id === tempId
+            ? { ...item, isUploading: false, error: err.message || 'Upload failed' }
+            : item
+        )
+      );
+    }
+  };
+
+  const handleFiles = (fileList) => {
+    setImageError(null);
+    const validFiles = [];
+    const maxSizeBytes = 10 * 1024 * 1024;
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+    for (const file of Array.from(fileList)) {
+      if (!allowedTypes.includes(file.type)) {
+        setImageError(`Unsupported format for "${file.name}". Only JPG, PNG, and WEBP are allowed.`);
+        continue;
+      }
+      if (file.size > maxSizeBytes) {
+        setImageError(`File "${file.name}" exceeds the 10MB limit.`);
+        continue;
+      }
+      validFiles.push(file);
+    }
+
+    if (validFiles.length === 0) return;
+
+    validFiles.forEach((file) => {
+      const tempId = `img_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const previewUrl = URL.createObjectURL(file);
+
+      const newImgItem = {
+        id: tempId,
+        url: previewUrl,
+        name: file.name,
+        size: file.size,
+        fileRef: file,
+        isUploading: true,
+        error: null,
+      };
+
+      setImages((prev) => [...prev, newImgItem]);
+      uploadSingleImage(file, tempId);
+    });
+  };
+
+  const handleRemoveImage = (idToRemove) => {
+    setImages((prev) => prev.filter((img) => img.id !== idToRemove));
+  };
+
+  const handleSetMainImage = (index) => {
+    if (index === 0) return;
+    setImages((prev) => {
+      const next = [...prev];
+      const [target] = next.splice(index, 1);
+      next.unshift(target);
+      return next;
+    });
+  };
+
+  const handleMoveImage = (index, direction) => {
+    const targetIdx = index + direction;
+    if (targetIdx < 0 || targetIdx >= images.length) return;
+    setImages((prev) => {
+      const next = [...prev];
+      const temp = next[index];
+      next[index] = next[targetIdx];
+      next[targetIdx] = temp;
+      return next;
+    });
+  };
+
   const handleSaveChanges = async (e) => {
     e?.preventDefault();
     setSaveError(null);
@@ -66,13 +216,24 @@ export default function EditProduct() {
       return;
     }
 
+    if (images.some((img) => img.isUploading)) {
+      setSaveError('Please wait for image uploads to complete before saving.');
+      return;
+    }
+
     setIsSaving(true);
     try {
+      // Only persisted URLs (existing records + successful uploads); never blob previews
+      const finalImageUrls = images
+        .filter((img) => !img.error && img.secure_url)
+        .map((img) => img.secure_url);
+
       const updateData = {
         title: name.trim(),
         description: description.trim(),
         masterPrice: Number(price),
         stock: Number(stock) || 0,
+        images: finalImageUrls,
       };
 
       await updateProductApi(id, updateData);
@@ -201,6 +362,141 @@ export default function EditProduct() {
                 className="w-full p-2.5 bg-slate-100 border border-slate-200 rounded-lg text-slate-500 text-xs"
               />
             </div>
+          </div>
+
+          {/* Product Images Management */}
+          <div className="pt-4 border-t border-slate-100 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-sm text-slate-900">Product Images</h3>
+                <p className="text-[11px] text-slate-500">The first image is the primary thumbnail across all channels.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="text-xs bg-blue-50 text-blue-700 hover:bg-blue-100 font-bold px-3 py-1.5 rounded-lg flex items-center gap-1"
+              >
+                <Plus className="w-3.5 h-3.5" /> Upload Image
+              </button>
+            </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files) {
+                  handleFiles(e.target.files);
+                  e.target.value = '';
+                }
+              }}
+            />
+
+            {imageError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-lg flex items-center justify-between">
+                <span>{imageError}</span>
+                <button type="button" onClick={() => setImageError(null)} className="text-rose-500 font-bold">×</button>
+              </div>
+            )}
+
+            {images.length > 0 ? (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                {images.map((img, idx) => {
+                  const isMain = idx === 0;
+                  return (
+                    <div
+                      key={img.id}
+                      className={`relative rounded-xl border p-2 bg-white flex flex-col justify-between ${
+                        isMain ? 'ring-2 ring-blue-500/50 border-blue-400' : 'border-slate-200'
+                      }`}
+                    >
+                      <div className="relative aspect-square w-full rounded-lg overflow-hidden bg-slate-50 border border-slate-100 mb-2 flex items-center justify-center">
+                        {img.isUploading ? (
+                          <div className="text-center p-2">
+                            <RefreshCw className="w-5 h-5 animate-spin text-blue-500 mx-auto mb-1" />
+                            <span className="text-[10px] text-slate-500">Uploading...</span>
+                          </div>
+                        ) : img.error ? (
+                          <div className="text-center p-2 text-rose-600">
+                            <AlertCircle className="w-5 h-5 mx-auto mb-1" />
+                            <span className="text-[10px] font-semibold block leading-tight">Upload failed</span>
+                            <span className="text-[9px] block leading-tight mt-0.5">{img.error}</span>
+                          </div>
+                        ) : (
+                          <ProductImage src={img.url} alt={img.name} fit="contain" className="w-full h-full" />
+                        )}
+
+                        {!img.isUploading && !img.error && isLocalDevImage(img.secure_url) && (
+                          <span
+                            className="absolute bottom-1 left-1 bg-amber-500 text-white font-bold text-[8px] px-1 py-0.5 rounded"
+                            title="Stored on local development disk. Migrate to Cloudinary before production."
+                          >
+                            Local dev
+                          </span>
+                        )}
+
+                        {isMain && (
+                          <span className="absolute top-1 left-1 bg-blue-600 text-white font-bold text-[9px] px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                            <Star className="w-2.5 h-2.5 fill-current" /> Main
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1 border-t border-slate-100 text-[10px]">
+                        {!isMain ? (
+                          <button
+                            type="button"
+                            onClick={() => handleSetMainImage(idx)}
+                            className="text-blue-600 font-semibold"
+                          >
+                            Set Main
+                          </button>
+                        ) : (
+                          <span className="text-slate-400 font-semibold">Primary</span>
+                        )}
+
+                        <div className="flex items-center gap-1">
+                          {idx > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleMoveImage(idx, -1)}
+                              className="p-1 text-slate-400 hover:text-slate-600"
+                              title="Move Left"
+                            >
+                              <MoveLeft className="w-3 h-3" />
+                            </button>
+                          )}
+                          {idx < images.length - 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleMoveImage(idx, 1)}
+                              className="p-1 text-slate-400 hover:text-slate-600"
+                              title="Move Right"
+                            >
+                              <MoveRight className="w-3 h-3" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveImage(img.id)}
+                            className="p-1 text-slate-400 hover:text-rose-600"
+                            title="Delete"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="p-4 border-2 border-dashed border-slate-200 rounded-xl text-center text-slate-400 text-xs">
+                No product images attached. Click "Upload Image" above to add photos.
+              </div>
+            )}
           </div>
         </div>
 

@@ -3,29 +3,29 @@ import mongoose from 'mongoose';
 const syncHistorySchema = new mongoose.Schema(
   {
     sellerId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type: mongoose.Schema.Types.Mixed,
       required: true,
       index: true,
     },
     channelId: {
-      type: mongoose.Schema.Types.ObjectId,
+      type: mongoose.Schema.Types.Mixed,
       ref: 'ChannelConnection',
       required: true,
     },
     provider: {
       type: String,
+      default: 'AMAZON',
       required: true,
     },
     syncType: {
       type: String,
-      enum: ['PRODUCT', 'INVENTORY', 'ORDER', 'WEBHOOK', 'FULL', 'MANUAL'],
+      enum: ['PRODUCT', 'INVENTORY', 'ORDER', 'WEBHOOK', 'FULL', 'MANUAL', 'AMAZON_CATALOG', 'AMAZON_LISTINGS'],
       default: 'MANUAL',
     },
     direction: {
       type: String,
       enum: ['IMPORT', 'EXPORT', 'BIDIRECTIONAL'],
-      default: 'BIDIRECTIONAL',
+      default: 'IMPORT',
     },
     status: {
       type: String,
@@ -37,13 +37,17 @@ const syncHistorySchema = new mongoose.Schema(
     recordsProcessed: { type: Number, default: 0 },
     recordsSucceeded: { type: Number, default: 0 },
     recordsFailed: { type: Number, default: 0 },
+    totalFetched: { type: Number, default: 0 },
+    totalCreated: { type: Number, default: 0 },
+    totalUpdated: { type: Number, default: 0 },
+    totalSkipped: { type: Number, default: 0 },
     error: { type: String, default: null },
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }
 );
 
-syncHistorySchema.index({ sellerId: 1, createdAt: -1 });
+syncHistorySchema.index({ sellerId: 1, provider: 1, createdAt: -1 });
 
 export const SyncHistory = mongoose.models.SyncHistory || mongoose.model('SyncHistory', syncHistorySchema);
 export default SyncHistory;

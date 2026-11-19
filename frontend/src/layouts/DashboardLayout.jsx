@@ -29,6 +29,7 @@ import {
   X
 } from 'lucide-react';
 import { mockNotifications } from '../utils/mockData';
+import { logoutApi } from '../services/authService';
 
 export default function DashboardLayout() {
   const location = useLocation();
@@ -36,6 +37,11 @@ export default function DashboardLayout() {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const [channelsOpen, setChannelsOpen] = useState(true);
+
+  const handleLogout = async () => {
+    await logoutApi();
+    navigate('/login');
+  };
 
   const navItems = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard },
@@ -185,7 +191,7 @@ export default function DashboardLayout() {
               <span>Help & Support</span>
             </Link>
             <button
-              onClick={() => navigate('/login')}
+              onClick={handleLogout}
               className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs font-medium text-rose-600 hover:bg-rose-50 transition-colors text-left"
             >
               <LogOut className="w-4 h-4" />
@@ -305,7 +311,7 @@ export default function DashboardLayout() {
                   </Link>
                   <div className="border-t border-slate-100 mt-1 pt-1">
                     <button
-                      onClick={() => navigate('/login')}
+                      onClick={handleLogout}
                       className="w-full flex items-center gap-2 px-4 py-2 text-xs text-rose-600 font-medium hover:bg-rose-50 text-left"
                     >
                       <LogOut className="w-4 h-4" />

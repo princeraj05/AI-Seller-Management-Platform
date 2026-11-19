@@ -1,126 +1,257 @@
+import mongoose from 'mongoose';
 import { User } from './user.model.js';
 import { Store } from '../onboarding/store.model.js';
-
-// Demo seller account for immediate testing without db setup
-const DEMO_USER = {
-  _id: 'demo-user-12345',
-  name: 'Prince Kumar',
-  email: 'prince@seller.com',
-  storeName: 'AI Seller Mart',
-  role: 'seller',
-};
+import { RefreshToken } from './refreshToken.model.js';
+import { adminAuth } from '../../config/firebase.js';
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken,
+  hashToken,
+  setRefreshTokenCookie,
+  clearRefreshTokenCookie,
+} from '../../utils/token.js';
 
 /**
- * @desc    Authenticate user & get token
- * @route   POST /api/auth/login
+ * @desc    Authenticate with Google / Firebase ID token & return cryptographic JWT access + refresh tokens
+ * @route   POST /api/auth/google
  * @access  Public
  */
-export const loginUser = async (req, res) => {
+export const loginWithGoogle = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is currently unreachable. Please check your MongoDB connection settings in .env.',
+        code: 'DB_UNAVAILABLE',
+      });
+    }
 
-    if (!email || !password) {
+    const { idToken } = req.body;
+
+    if (!idToken) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide email and password',
+        message: 'Google ID token is required',
+        code: 'MISSING_ID_TOKEN',
+      });
+    }
+
+    if (!adminAuth) {
+      return res.status(503).json({
+        success: false,
+        message: 'Google authentication service is currently unavailable',
+        code: 'FIREBASE_UNAVAILABLE',
+      });
+    }
+
+    let decodedToken;
+    try {
+      decodedToken = await adminAuth.verifyIdToken(idToken);
+    } catch (verifyErr) {
+      console.error('Firebase token verification error:', verifyErr.message);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired Google authentication token',
+        code: 'INVALID_FIREBASE_TOKEN',
+      });
+    }
+
+    if (!decodedToken || !decodedToken.uid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Google authentication failed: missing user identity',
+        code: 'INVALID_TOKEN_CLAIMS',
+      });
+    }
+
+    const { uid, email, name, picture } = decodedToken;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Google account does not provide an email address',
+        code: 'EMAIL_REQUIRED',
       });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Check MongoDB if connected
-    let user = null;
-    try {
-      user = await User.findOne({ email: normalizedEmail });
-    } catch (err) {
-      console.warn('MongoDB query bypassed or failed:', err.message);
-    }
+    // Find or auto-provision user in MongoDB
+    let user = await User.findOne({
+      $or: [{ firebaseUid: uid }, { email: normalizedEmail }],
+    });
 
-    if (user) {
-      if (user.password && user.password !== password && password !== 'Prince1234') {
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid email or password',
-        });
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: 'Login successful',
-        token: `jwt-token-${user._id}-${Date.now()}`,
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          storeName: user.storeName,
-          role: user.role,
-          onboardingCompleted: Boolean(user.onboardingCompleted),
-        },
-      });
-    }
-
-    // Default Demo user credential matching default form values
-    if (normalizedEmail === DEMO_USER.email.toLowerCase()) {
-      if (password !== 'Prince1234') {
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid password for demo account',
-        });
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: 'Login successful (Demo Mode)',
-        token: `jwt-token-demo-${Date.now()}`,
-        user: DEMO_USER,
-      });
-    }
-
-    // Auto-create user for testing
-    let newUser = null;
-    try {
-      newUser = await User.create({
-        name: email.split('@')[0],
+    if (!user) {
+      user = await User.create({
+        firebaseUid: uid,
         email: normalizedEmail,
-        password: password,
-        storeName: 'My Seller Store',
+        name: name || normalizedEmail.split('@')[0],
+        avatar: picture || '',
         role: 'seller',
+        isActive: true,
       });
-    } catch (err) {
-      console.warn('DB creation error:', err.message);
+    } else {
+      let shouldSave = false;
+      if (!user.firebaseUid) {
+        user.firebaseUid = uid;
+        shouldSave = true;
+      }
+      if (picture && !user.avatar) {
+        user.avatar = picture;
+        shouldSave = true;
+      }
+      if (shouldSave) {
+        await user.save();
+      }
     }
 
-    const userIdStr = newUser ? newUser._id.toString() : `user-${Date.now()}`;
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is disabled. Please contact support.',
+        code: 'ACCOUNT_DISABLED',
+      });
+    }
+
+    // Generate real cryptographic JWT tokens for persistent session
+    const accessToken = generateAccessToken(user);
+    const { refreshToken } = await generateRefreshToken(user);
+
+    // Set HttpOnly, Secure, SameSite refresh token cookie (never exposed in JSON)
+    setRefreshTokenCookie(res, refreshToken);
 
     return res.status(200).json({
       success: true,
-      message: 'Login successful',
-      token: `jwt-token-${userIdStr}-${Date.now()}`,
+      message: 'Google sign-in successful',
+      token: accessToken,
       user: {
-        id: userIdStr,
-        name: email.split('@')[0],
-        email: normalizedEmail,
-        storeName: 'My Seller Store',
-        role: 'seller',
-        onboardingCompleted: false,
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        storeName: user.storeName,
+        role: user.role,
+        sellerId: user.sellerId || user._id.toString(),
+        onboardingCompleted: Boolean(user.onboardingCompleted),
       },
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({
+    console.error('Google login error:', error);
+    return res.status(500).json({
       success: false,
-      message: error.message || 'Server Error during authentication',
+      message: error.message || 'Server error during Google authentication',
     });
   }
 };
 
 /**
- * @desc    Register a new seller
+ * @desc    Authenticate user & return cryptographic JWT access + refresh tokens
+ * @route   POST /api/auth/login
+ * @access  Public
+ */
+export const loginUser = async (req, res) => {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is currently unreachable. Please check your MongoDB connection settings in .env.',
+        code: 'DB_UNAVAILABLE',
+      });
+    }
+
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide both email and password',
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Query user and explicitly select password field
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password',
+      });
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is disabled. Please contact support.',
+      });
+    }
+
+    // Migration Strategy for Legacy Plaintext Passwords:
+    // If the existing user password is not bcrypt-hashed, reject login and require password reset
+    if (user.password && !user.password.startsWith('$2a$') && !user.password.startsWith('$2b$')) {
+      return res.status(403).json({
+        success: false,
+        message:
+          'Security upgrade required: Your account requires a password update before login. Please use the password reset endpoint.',
+        code: 'PASSWORD_RESET_REQUIRED',
+      });
+    }
+
+    // Verify password using bcrypt.compare
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password',
+      });
+    }
+
+    // Generate real cryptographic JWT tokens
+    const accessToken = generateAccessToken(user);
+    const { refreshToken } = await generateRefreshToken(user);
+
+    // Set HttpOnly, Secure cookie for refresh token (never exposed in JSON)
+    setRefreshTokenCookie(res, refreshToken);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      token: accessToken,
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        storeName: user.storeName,
+        role: user.role,
+        sellerId: user.sellerId || user._id.toString(),
+        onboardingCompleted: Boolean(user.onboardingCompleted),
+      },
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error during authentication',
+    });
+  }
+};
+
+/**
+ * @desc    Register a new seller with bcrypt password hashing and JWT issuance
  * @route   POST /api/auth/register
  * @access  Public
  */
 export const registerUser = async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is currently unreachable. Please check your MongoDB connection settings in .env.',
+        code: 'DB_UNAVAILABLE',
+      });
+    }
+
     const { name, email, password, storeName } = req.body;
 
     if (!email || !password) {
@@ -130,36 +261,264 @@ export const registerUser = async (req, res) => {
       });
     }
 
-    let newUser = {
-      id: `usr-${Date.now()}`,
-      name: name || email.split('@')[0],
-      email: email.toLowerCase().trim(),
-      storeName: storeName || 'New Seller Store',
-      role: 'seller',
-    };
-
-    try {
-      const created = await User.create({
-        name: newUser.name,
-        email: newUser.email,
-        password: password,
-        storeName: newUser.storeName,
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long',
       });
-      newUser.id = created._id;
-    } catch (err) {
-      console.warn('MongoDB user creation bypassed/failed:', err.message);
     }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existingUser = await User.findOne({ email: normalizedEmail });
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with this email address already exists',
+      });
+    }
+
+    // Create user (pre-save hook will hash password with bcrypt)
+    const user = await User.create({
+      name: name?.trim() || normalizedEmail.split('@')[0],
+      email: normalizedEmail,
+      password,
+      storeName: storeName?.trim() || 'My Seller Store',
+      role: 'seller',
+      isActive: true,
+    });
+
+    const accessToken = generateAccessToken(user);
+    const { refreshToken } = await generateRefreshToken(user);
+
+    setRefreshTokenCookie(res, refreshToken);
 
     return res.status(201).json({
       success: true,
       message: 'Registration successful',
-      token: `jwt-token-${newUser.id}-${Date.now()}`,
-      user: newUser,
+      token: accessToken,
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        storeName: user.storeName,
+        role: user.role,
+        sellerId: user.sellerId || user._id.toString(),
+        onboardingCompleted: Boolean(user.onboardingCompleted),
+      },
     });
   } catch (error) {
-    res.status(500).json({
+    console.error('Registration error:', error);
+    return res.status(500).json({
       success: false,
       message: error.message || 'Server error during registration',
+    });
+  }
+};
+
+/**
+ * @desc    Refresh access token with refresh token rotation and reuse detection
+ * @route   POST /api/auth/refresh
+ * @access  Public
+ */
+export const refreshAccessToken = async (req, res) => {
+  try {
+    const token = req.cookies?.refreshToken || req.body?.refreshToken;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Refresh token is required',
+        code: 'REFRESH_TOKEN_REQUIRED',
+      });
+    }
+
+    let decoded;
+    try {
+      decoded = verifyRefreshToken(token);
+    } catch (err) {
+      clearRefreshTokenCookie(res);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired refresh token. Please sign in again.',
+        code: 'INVALID_REFRESH_TOKEN',
+      });
+    }
+
+    if (!decoded || decoded.type !== 'refresh') {
+      clearRefreshTokenCookie(res);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token type. Refresh token expected.',
+      });
+    }
+
+    const tokenHash = hashToken(token);
+    const storedSession = await RefreshToken.findOne({ tokenHash });
+
+    // REUSE DETECTION: If token is not in DB or already marked as revoked
+    if (!storedSession || storedSession.isRevoked) {
+      if (storedSession && storedSession.family) {
+        // Revoke all tokens in this family to protect the compromised user
+        await RefreshToken.updateMany({ family: storedSession.family }, { $set: { isRevoked: true } });
+      }
+      if (decoded.sub) {
+        // Invalidate all tokens for this user
+        await User.findByIdAndUpdate(decoded.sub, { $inc: { tokenVersion: 1 } });
+      }
+      clearRefreshTokenCookie(res);
+      return res.status(401).json({
+        success: false,
+        message: 'Refresh token reuse detected. All sessions have been revoked for your security.',
+        code: 'TOKEN_REUSE_DETECTED',
+      });
+    }
+
+    const user = await User.findById(decoded.sub);
+
+    if (!user || user.isActive === false || (decoded.tokenVersion !== undefined && decoded.tokenVersion !== (user.tokenVersion || 0))) {
+      clearRefreshTokenCookie(res);
+      return res.status(401).json({
+        success: false,
+        message: 'Session has been invalidated. Please sign in again.',
+        code: 'SESSION_INVALID',
+      });
+    }
+
+    // Rotate: Revoke the used refresh token
+    storedSession.isRevoked = true;
+    await storedSession.save();
+
+    // Generate new access token and rotated refresh token in the same family
+    const newAccessToken = generateAccessToken(user);
+    const { refreshToken: newRefreshToken } = await generateRefreshToken(user, storedSession.family);
+
+    // Rotate HttpOnly cookie with new refresh token (never exposed in JSON)
+    setRefreshTokenCookie(res, newRefreshToken);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Token refreshed successfully',
+      token: newAccessToken,
+    });
+  } catch (error) {
+    console.error('Refresh token error:', error);
+    clearRefreshTokenCookie(res);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error during token refresh',
+    });
+  }
+};
+
+/**
+ * @desc    Logout user and revoke refresh token session
+ * @route   POST /api/auth/logout
+ * @access  Public
+ */
+export const logoutUser = async (req, res) => {
+  try {
+    const token = req.cookies?.refreshToken || req.body?.refreshToken;
+
+    if (token) {
+      const tokenHash = hashToken(token);
+      await RefreshToken.findOneAndUpdate({ tokenHash }, { $set: { isRevoked: true } });
+    }
+
+    clearRefreshTokenCookie(res);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Logged out successfully',
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error during logout',
+    });
+  }
+};
+
+/**
+ * @desc    Reset password (with bcrypt hashing) for migration or credential update
+ * @route   POST /api/auth/reset-password
+ * @access  Public
+ */
+export const resetPassword = async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body;
+
+    if (!email || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email and new password are required',
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters long',
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User account not found',
+      });
+    }
+
+    // If account has an existing bcrypt password, require current password verification
+    if (user.password && (user.password.startsWith('$2a$') || user.password.startsWith('$2b$'))) {
+      if (!currentPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'Current password is required to update password',
+        });
+      }
+      const isMatch = await user.comparePassword(currentPassword);
+      if (!isMatch) {
+        return res.status(401).json({
+          success: false,
+          message: 'Current password does not match',
+        });
+      }
+    }
+    // If account has a legacy plaintext password and currentPassword was supplied, verify it
+    else if (user.password && currentPassword) {
+      if (user.password !== currentPassword) {
+        return res.status(401).json({
+          success: false,
+          message: 'Current password does not match',
+        });
+      }
+    }
+
+    // Set new password (pre-save hook will hash with bcrypt)
+    user.password = newPassword;
+    user.mustResetPassword = false;
+    user.tokenVersion = (user.tokenVersion || 0) + 1; // Invalidate all prior sessions
+    await user.save();
+
+    // Revoke all existing refresh tokens for this user
+    await RefreshToken.updateMany({ userId: user._id }, { $set: { isRevoked: true } });
+
+    clearRefreshTokenCookie(res);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password updated and hashed successfully. Please sign in with your new password.',
+    });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error during password reset',
     });
   }
 };

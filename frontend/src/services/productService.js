@@ -60,6 +60,18 @@ export const deleteProductApi = async (id) => {
   }
 };
 
+export const uploadProductImageApi = async (payload) => {
+  try {
+    const response = await api.post('/products/upload-image', payload);
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Failed to upload product image');
+    }
+    throw new Error(error.message || 'Network error uploading product image');
+  }
+};
+
 export const getVariantsApi = async (productId = 'all') => {
   try {
     const url = productId === 'all' ? '/products/variants' : `/products/${productId}/variants`;

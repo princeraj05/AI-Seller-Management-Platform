@@ -5,6 +5,8 @@ import {
   getProductById,
   updateProduct,
   deleteProduct,
+  uploadProductImage,
+  getImageStorageStatus,
 } from './product.controller.js';
 import {
   createVariant,
@@ -23,6 +25,8 @@ router.use(tenantMiddleware);
 router.use(authorizeRoles('seller', 'admin'));
 
 router.get('/variants', getVariants);
+router.post('/upload-image', uploadProductImage);
+router.get('/storage-status', getImageStorageStatus);
 router.post('/', createProduct);
 router.get('/', getProducts);
 router.get('/:id', getProductById);

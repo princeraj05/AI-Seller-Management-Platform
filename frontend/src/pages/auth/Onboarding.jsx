@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Sparkles, ArrowRight, ArrowLeft, CheckCircle2, Store, ShoppingBag, BarChart2, Globe, Building } from 'lucide-react';
 import { submitOnboardingApi } from '../../services/onboardingService';
+import { registerApi } from '../../services/authService';
 
 export default function Onboarding() {
   const navigate = useNavigate();
@@ -9,11 +10,14 @@ export default function Onboarding() {
   const [businessName, setBusinessName] = useState('Bhartiye Crafts');
   const [ownerName, setOwnerName] = useState('Prince Kumar');
   const [mobile, setMobile] = useState('+91 98765 43210');
-  const [email, setEmail] = useState('prince@seller.com');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [selectedCategories, setSelectedCategories] = useState(['Fashion', 'Handicrafts']);
   const [selectedChannels, setSelectedChannels] = useState(['amazon', 'flipkart', 'myntra']);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+
+  const isLoggedIn = Boolean(localStorage.getItem('authToken'));
 
   const categoriesList = [
     { name: 'Fashion', desc: 'Clothing, Apparel & Accessories', icon: '👗' },
@@ -54,6 +58,34 @@ export default function Onboarding() {
     setErrorMsg('');
     setIsSubmitting(true);
     try {
+      // If user is not yet logged in, register first with real password
+      if (!isLoggedIn) {
+        if (!password || password.length < 8) {
+          setErrorMsg('Please choose a password with at least 8 characters');
+          setIsSubmitting(false);
+          setStep(2);
+          return;
+        }
+
+        const regRes = await registerApi({
+          name: ownerName,
+          email,
+          password,
+          storeName: businessName,
+        });
+
+        if (regRes.success && regRes.token) {
+          localStorage.setItem('authToken', regRes.token);
+          localStorage.removeItem('refreshToken');
+          sessionStorage.removeItem('refreshToken');
+          if (regRes.user) {
+            localStorage.setItem('user', JSON.stringify(regRes.user));
+          }
+        } else {
+          throw new Error(regRes.message || 'Registration failed');
+        }
+      }
+
       const payload = {
         businessName,
         ownerName,
@@ -190,9 +222,22 @@ export default function Onboarding() {
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  placeholder="seller@example.com"
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg"
                 />
               </div>
+              {!isLoggedIn && (
+                <div>
+                  <label className="block font-semibold text-slate-700 mb-1">Password * (min 8 chars)</label>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Create your secure password"
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg"
+                  />
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-between pt-6 border-t border-slate-100">

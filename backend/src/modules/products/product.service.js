@@ -1,8 +1,51 @@
 import { Product } from './product.model.js';
 import { ProductVariant } from './productVariant.model.js';
+import { isProductionEnv, isPublicHttpsUrl, isLocalOrRelativeUrl, isPersistentLocalAllowed } from '../../config/storage.js';
 
 // Fallback in-memory store if DB is offline or buffering
 export const inMemoryProductsMap = new Map();
+
+/**
+ * Normalize product image URLs (trim, string-only, dedupe).
+ * Production: only public HTTPS URLs are accepted (no localhost, relative /uploads, or http://),
+ * unless a persistent local disk is explicitly configured, in which case /uploads paths are allowed.
+ * Throws a descriptive error instead of silently dropping images.
+ */
+export const sanitizeProductImages = (images) => {
+  if (images === undefined) return undefined;
+  if (!Array.isArray(images)) {
+    throw new Error('images must be an array of URL strings.');
+  }
+  const cleaned = [];
+  for (const raw of images) {
+    const url = typeof raw === 'string' ? raw.trim() : (raw?.secure_url || raw?.url || '').trim();
+    if (url && !cleaned.includes(url)) cleaned.push(url);
+  }
+
+  if (isProductionEnv()) {
+    const allowLocalPaths = isPersistentLocalAllowed();
+    const invalid = cleaned.filter((u) => {
+      if (isPublicHttpsUrl(u)) return false;
+      if (allowLocalPaths && u.startsWith('/uploads/')) return false;
+      return true;
+    });
+    if (invalid.length > 0) {
+      const err = new Error(
+        `Invalid product image URL(s) for production: ${invalid.join(', ')}. Only public HTTPS URLs (e.g. Cloudinary secure_url) are allowed. Run the image migration script for legacy local images.`
+      );
+      err.code = 'INVALID_IMAGE_URL';
+      throw err;
+    }
+  } else {
+    const invalid = cleaned.filter(
+      (u) => !isPublicHttpsUrl(u) && !(isLocalOrRelativeUrl(u) && u.startsWith('/uploads/')) && !u.startsWith('http')
+    );
+    if (invalid.length > 0) {
+      throw new Error(`Invalid product image URL(s): ${invalid.join(', ')}`);
+    }
+  }
+  return cleaned;
+};
 
 export const createProductService = async (tenant, productData) => {
   const { sellerId, storeId } = tenant;
@@ -16,7 +59,6 @@ export const createProductService = async (tenant, productData) => {
     masterPrice,
     costPrice,
     stock,
-    images,
     variants,
     attributes,
     seo,
@@ -27,6 +69,7 @@ export const createProductService = async (tenant, productData) => {
     aiGenerated,
     aiApproved,
   } = productData;
+  const images = sanitizeProductImages(productData.images) || [];
 
   const normalizedSku = sku.toUpperCase().trim();
 
@@ -203,6 +246,10 @@ export const updateProductService = async (sellerId, productId, updateData) => {
   // Never allow changing sellerId or storeId
   delete updateData.sellerId;
   delete updateData.storeId;
+
+  if (updateData.images !== undefined) {
+    updateData.images = sanitizeProductImages(updateData.images);
+  }
 
   let product = null;
   try {

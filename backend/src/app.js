@@ -1,7 +1,14 @@
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { config } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/errorMiddleware.js';
+import { isProductionEnv, isPersistentLocalAllowed, getLocalUploadRoot } from './config/storage.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 import authRoutes from './routes/auth.routes.js';
 import onboardingRoutes from './modules/onboarding/onboarding.routes.js';
@@ -20,12 +27,32 @@ import aiIntelligenceRoutes from './modules/aiIntelligence/aiIntelligence.routes
 import notificationRoutes from './modules/notifications/notification.routes.js';
 import billingRoutes from './modules/billing/billing.routes.js';
 
+import { isOriginAllowed } from './middleware/csrfMiddleware.js';
+
 const app = express();
 
-// Express Middleware
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Express Middleware: Strict CORS with exact allowed origin (never wildcard with credentials)
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        return callback(null, origin || true);
+      }
+      return callback(new Error(`CORS blocked for untrusted origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+    exposedHeaders: ['set-cookie'],
+  })
+);
+app.use(cookieParser());
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+// Local upload assets: development only, or production with explicit persistent disk
+if (!isProductionEnv() || isPersistentLocalAllowed()) {
+  app.use('/uploads', express.static(getLocalUploadRoot()));
+}
 
 // Health Check Route
 app.get('/api/health', (req, res) => {
@@ -38,6 +65,7 @@ app.get('/api/health', (req, res) => {
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/v1/auth', authRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/products/categories', categoryRoutes);
 app.use('/api/products', productRoutes);
@@ -47,6 +75,7 @@ app.use('/api/pos', posRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/returns', returnRoutes);
 app.use('/api/channels', channelRoutes);
+app.use('/api/v1/channels', channelRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/trends', trendRoutes);

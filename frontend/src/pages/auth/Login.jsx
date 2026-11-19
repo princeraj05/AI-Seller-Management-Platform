@@ -20,17 +20,28 @@ import {
   FileText,
   BarChart3
 } from 'lucide-react';
-import { loginApi } from '../../services/authService';
+import { loginApi, googleLoginApi, resetPasswordApi } from '../../services/authService';
+import { auth, googleProvider } from '../../config/firebase';
+import { signInWithPopup } from 'firebase/auth';
 
 export default function Login() {
   const navigate = useNavigate();
-  const [email, setEmail] = useState('prince@seller.com');
-  const [password, setPassword] = useState('Prince1234');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+
+  // Password Reset / Migration Modal state
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [resetEmail, setResetEmail] = useState('');
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('');
+  const [newPasswordInput, setNewPasswordInput] = useState('');
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetError, setResetError] = useState('');
+  const [resetSuccess, setResetSuccess] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -40,8 +51,10 @@ export default function Login() {
 
     try {
       const res = await loginApi(email, password);
-      if (res.success) {
-        localStorage.setItem('authToken', res.token || 'mock-token-12345');
+      if (res.success && res.token) {
+        localStorage.setItem('authToken', res.token);
+        localStorage.removeItem('refreshToken');
+        sessionStorage.removeItem('refreshToken');
         if (res.user) {
           localStorage.setItem('user', JSON.stringify(res.user));
         }
@@ -53,18 +66,82 @@ export default function Login() {
         setErrorMsg(res.message || 'Login failed. Please check your credentials.');
       }
     } catch (err) {
-      setErrorMsg(err.message || 'An error occurred during sign in.');
+      if (err.code === 'PASSWORD_RESET_REQUIRED') {
+        setResetEmail(email);
+        setShowResetModal(true);
+        setErrorMsg('Security upgrade required: Please set a new secure password for your account.');
+      } else {
+        setErrorMsg(err.message || 'An error occurred during sign in.');
+      }
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleGoogleSignIn = () => {
-    localStorage.setItem('authToken', 'google-mock-token-999');
-    setSuccessMsg('Google sign-in successful! Redirecting...');
-    setTimeout(() => {
-      navigate('/');
-    }, 800);
+  const handleGoogleSignIn = async () => {
+    setErrorMsg('');
+    try {
+      if (!auth) {
+        setErrorMsg('Google Sign-in is not configured. Please sign in with your email and password.');
+        return;
+      }
+      setIsLoading(true);
+      const result = await signInWithPopup(auth, googleProvider);
+      const idToken = await result.user.getIdToken();
+      if (idToken) {
+        const res = await googleLoginApi(idToken);
+        if (res.success && res.token) {
+          localStorage.setItem('authToken', res.token);
+          localStorage.removeItem('refreshToken');
+          sessionStorage.removeItem('refreshToken');
+          if (res.user) {
+            localStorage.setItem('user', JSON.stringify(res.user));
+          }
+          setSuccessMsg('Google sign-in successful! Redirecting...');
+          setTimeout(() => {
+            navigate('/');
+          }, 800);
+        } else {
+          setErrorMsg(res.message || 'Google sign-in failed. Please try again.');
+        }
+      }
+    } catch (err) {
+      console.warn('Google sign-in failed:', err.message);
+      setErrorMsg(err.message || 'Google sign-in could not be completed.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handlePasswordResetSubmit = async (e) => {
+    e.preventDefault();
+    setResetError('');
+    setResetSuccess('');
+    setResetLoading(true);
+
+    try {
+      const res = await resetPasswordApi({
+        email: resetEmail,
+        currentPassword: currentPasswordInput,
+        newPassword: newPasswordInput,
+      });
+
+      if (res.success) {
+        setResetSuccess('Password updated successfully! You can now sign in.');
+        setTimeout(() => {
+          setShowResetModal(false);
+          setEmail(resetEmail);
+          setPassword('');
+          setResetSuccess('');
+        }, 1500);
+      } else {
+        setResetError(res.message || 'Password update failed.');
+      }
+    } catch (err) {
+      setResetError(err.message || 'Password update failed.');
+    } finally {
+      setResetLoading(false);
+    }
   };
 
   return (
@@ -367,9 +444,16 @@ export default function Login() {
                   />
                   <span>Remember me</span>
                 </label>
-                <a href="#forgot" className="text-blue-600 font-semibold hover:text-blue-700 hover:underline">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setResetEmail(email);
+                    setShowResetModal(true);
+                  }}
+                  className="text-blue-600 font-semibold hover:text-blue-700 hover:underline"
+                >
                   Forgot password?
-                </a>
+                </button>
               </div>
 
               {/* Primary Action Button */}
@@ -452,6 +536,85 @@ export default function Login() {
         </div>
 
       </main>
+      {/* Password Reset & Security Upgrade Modal */}
+      {showResetModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 p-6 sm:p-8 max-w-md w-full relative">
+            <h3 className="text-lg font-bold text-slate-900">Account Password Reset</h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Set a new secure password (minimum 8 characters) for your account.
+            </p>
+
+            {resetError && (
+              <div className="mt-3 p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
+                {resetError}
+              </div>
+            )}
+            {resetSuccess && (
+              <div className="mt-3 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-700 font-medium">
+                {resetSuccess}
+              </div>
+            )}
+
+            <form onSubmit={handlePasswordResetSubmit} className="mt-4 space-y-3.5">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Email address</label>
+                <input
+                  type="email"
+                  required
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
+                  placeholder="Enter your account email"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-blue-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Current password (if known)
+                </label>
+                <input
+                  type="password"
+                  value={currentPasswordInput}
+                  onChange={(e) => setCurrentPasswordInput(e.target.value)}
+                  placeholder="Leave empty if upgrading from legacy account"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-blue-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">New password</label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={newPasswordInput}
+                  onChange={(e) => setNewPasswordInput(e.target.value)}
+                  placeholder="Minimum 8 characters"
+                  className="w-full px-3.5 py-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-blue-600"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowResetModal(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={resetLoading}
+                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors disabled:opacity-50"
+                >
+                  {resetLoading ? 'Updating...' : 'Update Password'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

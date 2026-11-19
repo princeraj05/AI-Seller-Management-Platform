@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { Package, Plus, Search, Filter, Eye, Edit, Trash2, RefreshCw, AlertCircle } from 'lucide-react';
 import { getProductsApi, deleteProductApi } from '../../services/productService';
 import { getCategoriesApi } from '../../services/categoryService';
+import ProductImage from '../../components/common/ProductImage';
 
 export default function ProductCatalog() {
   const [searchTerm, setSearchTerm] = useState('');
@@ -189,18 +190,19 @@ export default function ProductCatalog() {
                 const id = product._id || product.id;
                 const title = product.title || product.name;
                 const category = product.categoryName || product.category || 'Fashion';
-                const image = Array.isArray(product.images) && product.images.length > 0
+                const rawImage = Array.isArray(product.images) && product.images.length > 0
                   ? product.images[0]
-                  : 'https://images.unsplash.com/photo-1583391733956-6c78276477e2?w=150';
+                  : null;
 
                 return (
                   <tr key={id} className="hover:bg-slate-50">
                     <td className="p-4">
                       <div className="flex items-center gap-3">
-                        <img
-                          src={image}
+                        <ProductImage
+                          src={rawImage}
                           alt={title}
-                          className="w-10 h-10 rounded-lg object-cover border border-slate-200"
+                          className="w-10 h-10 rounded-lg border border-slate-200 shrink-0"
+                          iconClassName="w-4 h-4"
                         />
                         <div>
                           <span className="font-bold text-slate-900 block">{title}</span>

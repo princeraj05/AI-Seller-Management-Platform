@@ -1,30 +1,129 @@
-import axios from 'axios';
+import api from './api';
+import { auth } from '../config/firebase';
+import { signOut } from 'firebase/auth';
 
-const API_URL = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
-
+/**
+ * Log in seller with email and password
+ */
 export const loginApi = async (email, password) => {
   try {
-    const response = await axios.post(`${API_URL}/auth/login`, {
+    const response = await api.post('/auth/login', {
       email,
       password,
     });
     return response.data;
   } catch (error) {
     if (error.response && error.response.data) {
-      throw new Error(error.response.data.message || 'Login failed');
+      const err = new Error(error.response.data.message || 'Login failed');
+      err.code = error.response.data.code;
+      throw err;
     }
-    // If backend is unreachable, fallback to client-side auth response so app remains operational
-    console.warn('Backend server unreachable, falling back to local auth mode.');
-    return {
-      success: true,
-      token: `local-fallback-token-${Date.now()}`,
-      user: {
-        id: 'demo-123',
-        name: email.split('@')[0],
-        email: email,
-        storeName: 'AI Seller Mart',
-        role: 'seller',
-      },
-    };
+    throw new Error(error.message || 'Network error during login');
+  }
+};
+
+/**
+ * Log in / authenticate with Google Firebase ID token to obtain platform JWT access + refresh tokens
+ */
+export const googleLoginApi = async (idToken) => {
+  try {
+    const response = await api.post('/auth/google', { idToken });
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      const err = new Error(error.response.data.message || 'Google authentication failed');
+      err.code = error.response.data.code;
+      throw err;
+    }
+    throw new Error(error.message || 'Network error during Google authentication');
+  }
+};
+
+/**
+ * Register a new seller account
+ */
+export const registerApi = async (userData) => {
+  try {
+    const response = await api.post('/auth/register', userData);
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Registration failed');
+    }
+    throw new Error(error.message || 'Network error during registration');
+  }
+};
+
+/**
+ * Manually trigger refresh token using HttpOnly cookie credentials
+ */
+export const refreshApi = async () => {
+  try {
+    const response = await api.post('/auth/refresh', {});
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Token refresh failed');
+    }
+    throw new Error(error.message || 'Network error during token refresh');
+  }
+};
+
+/**
+ * Log out and revoke session on backend (clearing HttpOnly cookie and database record) and Firebase
+ */
+export const logoutApi = async () => {
+  try {
+    await api.post('/auth/logout', {});
+  } catch (err) {
+    console.warn('Logout API notification warning:', err.message);
+  } finally {
+    try {
+      if (auth?.currentUser) {
+        await signOut(auth);
+      }
+    } catch (fbErr) {
+      console.warn('Firebase signout warning:', fbErr.message);
+    }
+    localStorage.removeItem('authToken');
+    localStorage.removeItem('refreshToken');
+    sessionStorage.removeItem('refreshToken');
+    localStorage.removeItem('user');
+    localStorage.removeItem('store');
+    localStorage.removeItem('onboardingCompleted');
+  }
+};
+
+/**
+ * Reset password (used for migration or credential changes)
+ */
+export const resetPasswordApi = async ({ email, currentPassword, newPassword }) => {
+  try {
+    const response = await api.post('/auth/reset-password', {
+      email,
+      currentPassword,
+      newPassword,
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Password reset failed');
+    }
+    throw new Error(error.message || 'Network error during password reset');
+  }
+};
+
+/**
+ * Get current authenticated user profile
+ */
+export const getMeApi = async () => {
+  try {
+    const response = await api.get('/auth/me');
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Failed to fetch user profile');
+    }
+    throw new Error(error.message || 'Network error fetching user profile');
   }
 };

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Edit, Sparkles, Store, ShoppingBag, BarChart2, Building, RefreshCw, AlertCircle } from 'lucide-react';
 import { getProductByIdApi } from '../../services/productService';
+import ProductImage from '../../components/common/ProductImage';
 
 export default function ProductDetails() {
   const { id } = useParams();
@@ -63,9 +64,9 @@ export default function ProductDetails() {
   const productId = product._id || product.id;
   const title = product.title || product.name || 'Untitled Product';
   const category = product.categoryName || product.category || 'Fashion';
-  const image = Array.isArray(product.images) && product.images.length > 0
+  const rawImage = Array.isArray(product.images) && product.images.length > 0
     ? product.images[0]
-    : 'https://images.unsplash.com/photo-1583391733956-6c78276477e2?w=500';
+    : null;
 
   return (
     <div className="space-y-6 font-sans">
@@ -81,7 +82,12 @@ export default function ProductDetails() {
       <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm grid grid-cols-1 md:grid-cols-3 gap-8 text-xs">
         {/* Product Image Gallery */}
         <div>
-          <img src={image} alt={title} className="w-full h-72 object-cover rounded-xl border border-slate-200" />
+          <ProductImage
+            src={rawImage}
+            alt={title}
+            className="w-full h-72 rounded-xl border border-slate-200"
+            iconClassName="w-10 h-10"
+          />
         </div>
 
         {/* Product Information */}
