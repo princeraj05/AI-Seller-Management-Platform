@@ -1,18 +1,22 @@
-﻿"""
+"""
 Centralized Configuration Management using Pydantic Settings.
 Environment variables are strictly parsed, validated, and sanitized.
 """
 from functools import lru_cache
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_AI_MODULE_DIR = Path(__file__).resolve().parent.parent.parent
+_ENV_FILE_PATH = _AI_MODULE_DIR / ".env"
 
 
 class Settings(BaseSettings):
     """Application settings with environment variable fallbacks."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE_PATH,
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore"
@@ -37,16 +41,20 @@ class Settings(BaseSettings):
     NODE_BACKEND_URL: str = Field(default="http://localhost:5000", description="Base URL of Node.js backend")
     NODE_BACKEND_TIMEOUT: float = Field(default=15.0, description="Timeout in seconds for Node.js requests")
 
-    # Phase 02: Computer Vision Model Provider Settings
-    VISION_MODEL_PROVIDER: str = Field(default="ollama", description="Vision provider: ollama or gemini")
-    VISION_MODEL_NAME: str = Field(default="qwen2.5-vl:7b", description="Default Vision-Language model name")
+    # Phase 02 & 02.2: Computer Vision Model Provider Settings
+    VISION_PROVIDER: str = Field(default="gemini", description="Primary vision provider: gemini or ollama")
+    VISION_MODEL_PROVIDER: Optional[str] = Field(default=None, description="Backward-compatible alias for VISION_PROVIDER")
+    VISION_MODEL_NAME: str = Field(default="gemini-3.8-flash", description="Active Vision-Language model name")
     VISION_REQUEST_TIMEOUT: float = Field(default=60.0, description="Vision inference request timeout in seconds")
+
+    # Cloud AI Provider: Google Gemini
+    GEMINI_API_KEY: Optional[str] = Field(default=None, description="Google Gemini API key")
+    GEMINI_MODEL: str = Field(default="gemini-3.8-flash", description="Default Gemini model name (gemini-3.8-flash)")
+    GEMINI_TIMEOUT: float = Field(default=60.0, description="Gemini inference timeout in seconds")
+
+    # Optional Local AI Provider: Ollama (Preserved for GPU environments)
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", description="Ollama server base URL")
     OLLAMA_MODEL: str = Field(default="qwen2.5-vl:7b", description="Fallback Ollama model name")
-
-    # Cloud AI Provider (Optional Fallback)
-    GEMINI_API_KEY: Optional[str] = Field(default=None, description="Optional Google Gemini API key")
-    GEMINI_MODEL: str = Field(default="gemini-1.5-flash", description="Default Gemini model name")
 
     # Phase 02: OCR Engine Settings
     OCR_ENABLED: bool = Field(default=True, description="Enable or disable OCR text extraction")
@@ -71,6 +79,15 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid LOG_LEVEL '{v}'. Must be one of {valid_levels}")
         return upper_v
 
+    @field_validator("VISION_PROVIDER")
+    @classmethod
+    def validate_vision_provider(cls, v: str) -> str:
+        valid_providers = {"gemini", "ollama"}
+        lower_v = v.lower().strip()
+        if lower_v not in valid_providers:
+            raise ValueError(f"Invalid VISION_PROVIDER '{v}'. Must be one of {valid_providers}")
+        return lower_v
+
     @field_validator("AI_SERVICE_SECRET")
     @classmethod
     def validate_service_secret(cls, v: str, info) -> str:
@@ -81,6 +98,18 @@ class Settings(BaseSettings):
             if len(v) < 32:
                 raise ValueError("In production, AI_SERVICE_SECRET must be at least 32 characters long.")
         return v
+
+    def model_post_init(self, __context: Any) -> None:
+        # Backward compatibility: if legacy VISION_MODEL_PROVIDER was explicitly supplied
+        if self.VISION_MODEL_PROVIDER and self.VISION_PROVIDER == "gemini" and self.VISION_MODEL_PROVIDER.lower() != "gemini":
+            self.VISION_PROVIDER = self.VISION_MODEL_PROVIDER.lower().strip()
+        self.VISION_MODEL_PROVIDER = self.VISION_PROVIDER
+
+        # Synchronize active vision model name based on provider
+        if self.VISION_PROVIDER == "gemini":
+            self.VISION_MODEL_NAME = self.GEMINI_MODEL
+        elif self.VISION_PROVIDER == "ollama":
+            self.VISION_MODEL_NAME = self.OLLAMA_MODEL
 
     @property
     def is_production(self) -> bool:

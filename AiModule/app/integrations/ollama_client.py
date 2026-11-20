@@ -1,4 +1,4 @@
-﻿"""
+"""
 Ollama Vision-Language Model Integration Client.
 Provides asynchronous communication with Ollama for multimodal image understanding.
 """
@@ -53,6 +53,7 @@ class OllamaVisionClient:
         client: Optional[httpx.AsyncClient] = None,
     ):
         settings = get_settings()
+        self.provider = "ollama"
         self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
         self.model_name = model_name or settings.VISION_MODEL_NAME
         self.timeout = timeout or settings.VISION_REQUEST_TIMEOUT
@@ -80,7 +81,7 @@ class OllamaVisionClient:
         """
         client = await self._get_client()
         try:
-            response = await client.get("/api/tags")
+            response = await client.get("/api/tags", timeout=httpx.Timeout(2.0, connect=2.0))
             if response.status_code == 200:
                 data = response.json()
                 models = [m.get("name") for m in data.get("models", [])]
@@ -97,7 +98,7 @@ class OllamaVisionClient:
                 "model_found": False,
                 "error": f"Ollama returned HTTP {response.status_code}",
             }
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.TimeoutException):
             return {
                 "reachable": False,
                 "model_configured": self.model_name,

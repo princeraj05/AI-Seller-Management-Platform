@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pydantic Schemas for Computer Vision, OCR, and Product Intelligence.
 """
 from typing import Any, Dict, List, Optional
@@ -70,3 +70,21 @@ class ProductIntelligenceResult(BaseModel):
     uncertainties: List[str] = Field(default_factory=list, description="List of visual ambiguities or undetermined specifications")
     image_metadata: ImageMetadata = Field(..., description="Image technical specifications")
     processing_metadata: Dict[str, Any] = Field(default_factory=dict, description="Model and engine execution diagnostics")
+
+
+class HandicraftVisionOutput(BaseModel):
+    """Pydantic schema used for structured multimodal vision output from Google Gemini / LLM."""
+
+    product_type: str = Field(..., description="Specific handicraft item title or type (e.g. Handcrafted Terracotta Floral Vase)")
+    visual_description: str = Field(..., description="Objective, grounded visual summary of visible elements, styling, and design")
+    multiple_products_detected: bool = Field(default=False, description="True if multiple distinct products or staging sets are in the photo")
+    suggested_primary_category: str = Field(..., description="Catalog primary category (e.g. Home Decor & Living, Fashion & Apparel, Jewelry & Accessories)")
+    suggested_subcategory: str = Field(..., description="Catalog subcategory (e.g. Vases & Planters, Sarees & Ethnic Wear, Earrings & Jhumkas)")
+    primary_color: str = Field(..., description="Dominant visible color of the main item")
+    secondary_colors: List[str] = Field(default_factory=list, description="List of secondary visible colors")
+    apparent_material: str = Field(..., description="Apparent surface material texture/finish (e.g. Terracotta clay, Brass metal, Teak wood, Cotton weave)")
+    pattern: Optional[str] = Field(default=None, description="Visible surface pattern (e.g. Floral engraving, Sanganeri block print, Plain)")
+    shape: Optional[str] = Field(default=None, description="Geometric or physical shape (e.g. Cylindrical, Bell-shaped, Round, Rectangular)")
+    craft_technique: Optional[str] = Field(default=None, description="Artisanal craft technique observed (e.g. Hand Carving, Clay Firing, Block Printing)")
+    decorative_elements: List[str] = Field(default_factory=list, description="Notable decorative details (e.g. Brass inlays, Jhumka bells, Glazed rim)")
+    uncertainties: List[str] = Field(default_factory=list, description="Visual ambiguities, unverified material purity, or unconfirmed specs")

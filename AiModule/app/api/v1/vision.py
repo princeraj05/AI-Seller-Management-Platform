@@ -1,4 +1,4 @@
-﻿"""
+"""
 Computer Vision and Product Intelligence API Routes.
 """
 from typing import Optional
@@ -8,6 +8,7 @@ from app.api.dependencies import get_request_context, require_seller_context, ve
 from app.core.config import get_settings
 from app.core.exceptions import ValidationError
 from app.core.security import RequestContext
+from app.integrations.gemini_vision_client import GeminiVisionClient
 from app.integrations.ollama_client import OllamaVisionClient
 from app.schemas.common import BaseResponse
 from app.schemas.vision import ProductIntelligenceResult
@@ -64,8 +65,26 @@ async def get_vision_engine_status(
     without initializing heavy model weights.
     """
     settings = get_settings()
-    ollama_client = OllamaVisionClient()
-    ollama_diag = await ollama_client.check_availability()
+    provider = settings.VISION_PROVIDER.lower()
+
+    gemini_client = GeminiVisionClient()
+    gemini_diag = await gemini_client.check_availability()
+
+    if provider == "gemini":
+        active_status = gemini_diag
+        vision_ready = bool(gemini_diag.get("configured", False))
+        ollama_diag = {
+            "reachable": False,
+            "provider": "ollama",
+            "model_configured": settings.OLLAMA_MODEL,
+            "model_found": False,
+            "note": "Ollama network check skipped; active provider is Gemini.",
+        }
+    else:
+        ollama_client = OllamaVisionClient()
+        ollama_diag = await ollama_client.check_availability()
+        active_status = ollama_diag
+        vision_ready = bool(ollama_diag.get("reachable", False) and ollama_diag.get("model_found", False))
 
     ocr_service = get_ocr_service()
     ocr_available = ocr_service.is_available()
@@ -74,12 +93,16 @@ async def get_vision_engine_status(
         success=True,
         message="Vision and OCR engine diagnostic status",
         data={
-            "vision_provider": settings.VISION_MODEL_PROVIDER,
+            "vision_provider": provider,
             "vision_model_configured": settings.VISION_MODEL_NAME,
+            "gemini_status": gemini_diag,
             "ollama_status": ollama_diag,
+            "active_provider_status": active_status,
+            "vision_ready": vision_ready,
             "ocr_enabled": settings.OCR_ENABLED,
             "ocr_engine": "PaddleOCR",
             "ocr_library_installed": ocr_available,
+            "ready": vision_ready and ocr_available,
         },
         request_id=context.request_id,
     )

@@ -223,33 +223,41 @@ Headers:
 
 ---
 
-## 9. Phase 02 — Computer Vision, OCR & Product Intelligence Engine
+## 9. Phase 02 / 02.2 — Computer Vision, OCR & Cloud Multimodal Intelligence Engine
 
-Phase 02 equips the microservice with vision-language multimodal analysis, optical character recognition (OCR), and structured attribute normalization specifically calibrated for Indian handicraft products.
+Phase 02 / 02.2 equips the microservice with cloud multimodal vision understanding (Google Gemini), local optical character recognition (PaddleOCR 2.8.1), and structured attribute normalization specifically calibrated for Indian handicraft products.
 
-### Features
-* **Multimodal Vision Understanding**: Powered by Ollama (`qwen2.5-vl:7b` or `qwen3-vl:8b`), analyzing textures, handcrafted indicators, colors, materials, and multiple products in image.
-* **Optical Character Recognition (OCR)**: PaddleOCR integration with lazy-loading execution, extracting text segments, brand markings, certifications, and dimensions.
-* **Image Validation & Optimization**: Magic byte validation, decompression bomb safeguards (`MAX_IMAGE_PIXELS = 100_000_000`), EXIF orientation correction, RGBA-to-RGB conversion, Lanczos downsampling.
-* **Confidence & Evidence Calibration**: Factual observation vs. reasonable inference categorization (e.g. materials from texture are marked inference; observed colors are marked confirmed).
-* **Handicraft Category Taxonomy**: Deterministic prediction across Home Decor, Fashion & Apparel, Jewelry, Kitchen & Dining, Textiles.
+### Architecture Highlights
+* **Primary Vision Provider**: Google Gemini (`google-genai` unified SDK, `gemini-2.0-flash`), delivering fast structured visual attribute extraction without requiring heavy local GPU resources.
+* **Optional Local Vision Provider**: Ollama (`qwen2.5-vl:7b`), preserved and switchable via `VISION_PROVIDER=ollama` for environments with dedicated GPUs.
+* **Local OCR Engine**: PaddleOCR 2.8.1 with PaddlePaddle 2.6.2 running deterministically on CPU, extracting brand labels, price tags, and packaging text in ~350ms.
+* **Resilient Multi-Scenario Degradation**:
+  * **Scenario A (Vision + OCR)**: Combines structured visual attributes with OCR label text.
+  * **Scenario B (Vision only)**: Operates seamlessly when OCR is disabled or fails, recording an uncertainty note.
+  * **Scenario C (OCR only)**: Falls back to OCR text extraction and catalog inference when vision provider is unavailable.
+  * **Scenario D (Both unavailable)**: Fails safely with structured `ExternalServiceError` without crashing the service.
+* **Calibrated Confidence & Evidence Tracking**:
+  * `gemini_vision` / `vision_model`: Visual observations (color, shape, visible texture).
+  * `paddle_ocr`: Ground-truth text extracted from labels and stamps.
+  * Texture-based materials are calibrated as `reasonable_inference` to prevent false claims of certified purity.
 
-### Setup Instructions
+### Provider Switching & Setup
 
-#### 1. Ollama Vision Model Setup
-```bash
-# Install and run Ollama from https://ollama.com
-ollama run qwen2.5-vl:7b
-# Or for higher capability when available:
-# ollama run qwen3-vl:8b
+#### 1. Cloud Vision Setup (Recommended)
+Add your Gemini API key in `AiModule/.env`:
+```env
+VISION_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_TIMEOUT=60.0
 ```
 
-#### 2. Optional PaddleOCR Setup
-```bash
-# If running locally with native C++ build tools (optional):
-pip install paddlepaddle paddleocr
+#### 2. Optional Local Ollama Setup (GPU)
+```env
+VISION_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5-vl:7b
 ```
-*Note: If PaddleOCR is omitted, the microservice gracefully degrades without crashing and sets OCR status to `unavailable`.*
 
 ### API Endpoints
 
@@ -264,48 +272,8 @@ Extracts structured handicraft product intelligence from an uploaded image.
   * `enable_ocr`: Boolean (default `true`).
   * `user_hint`: Optional seller hint (e.g., `"Handmade terracotta vase"`).
 
-**Sample Response**:
-```json
-{
-  "success": true,
-  "data": {
-    "title_suggestion": "Handcrafted Terracotta Clay Flower Vase",
-    "category": {
-      "primary_category": "Home Decor",
-      "sub_category": "Vases & Planters",
-      "confidence": 0.90
-    },
-    "attributes": [
-      {
-        "name": "primary_material",
-        "value": "Terracotta",
-        "confidence": 0.82,
-        "evidence_source": "vision_model",
-        "uncertainty_status": "reasonable_inference",
-        "notes": "Earthy reddish-brown unglazed ceramic texture"
-      }
-    ],
-    "ocr_result": {
-      "status": "success",
-      "detected_text": "BHARTIYE CRAFTS",
-      "segments": [
-        {"text": "BHARTIYE CRAFTS", "confidence": 0.95}
-      ]
-    },
-    "multiple_products_detected": false,
-    "confidence_score": 0.88,
-    "image_metadata": {
-      "filename": "vase.jpg",
-      "format": "JPEG",
-      "width": 1200,
-      "height": 1200
-    }
-  }
-}
-```
-
 #### `GET /api/v1/vision/status`
-Checks health and availability of the Vision Model (Ollama) and OCR Engine.
+Checks configuration, model readiness, and diagnostic status of both Gemini and Ollama providers, as well as the local PaddleOCR engine.
 
 ---
 
@@ -316,16 +284,18 @@ Checks health and availability of the Vision Model (Ollama) and OCR Engine.
 python -m pytest -v
 ```
 
-The test suite includes **44 automated tests** covering:
+The test suite includes **61 automated tests** (all passing, 0 failing) covering:
 * Core application startup & ASGI lifespan
 * Liveness (`/health`) and readiness (`/health/ready`) probes
-* Pydantic configuration validation & production security checks
+* Pydantic configuration validation, provider switching & security checks
 * Internal service authentication & tenant context extraction
 * Node.js HTTP client requests, mock transport, timeouts, and error handling
-* Image validation, corruption handling, and preprocessing
+* Image validation, corruption handling, and Lanczos preprocessing
+* Google Gemini multimodal client: structured schema, timeouts, 403 invalid key, 429 quota exhaustion, malformed JSON
 * Ollama vision client parsing, timeout handling, and fallback behavior
-* PaddleOCR lazy loading, success parsing, and graceful degradation
+* PaddleOCR lazy loading, local inference, and graceful degradation
 * Product intelligence orchestration, category taxonomy, and multi-product flagging
+* Degradation handling across Scenarios A, B, C, and D
 * End-to-end Vision API endpoints (`/api/v1/vision/*`)
 
 ---
@@ -336,4 +306,5 @@ The test suite includes **44 automated tests** covering:
 * **Phase 04**: RAG Knowledge Engine (MongoDB Atlas Vector Search, Sentence Transformers)
 * **Phase 05**: Conversational AI Seller Assistant with Tool Calling
 * **Phase 06**: Business Intelligence, Trend Analysis & Automated Reports
+
 

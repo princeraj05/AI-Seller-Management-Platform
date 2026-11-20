@@ -1,4 +1,4 @@
-﻿"""
+"""
 Confidence and Uncertainty Handling Utilities.
 Provides calibrated categorization of attribute evidence without fabricating statistical precision.
 """
@@ -9,9 +9,12 @@ from typing import Optional, Tuple
 class EvidenceSource(str, Enum):
     """Source of truth from which an attribute was derived."""
     VISION_MODEL = "vision_model"
+    GEMINI_VISION = "gemini_vision"
     OCR = "ocr"
+    PADDLE_OCR = "paddle_ocr"
     IMAGE_PROCESSING = "image_processing"
     COMBINED = "combined"
+    SELLER_INPUT = "seller_input"
     INFERRED = "inferred"
 
 
@@ -53,7 +56,7 @@ def evaluate_confidence(
         return round(conf, 2), UncertaintyStatus.REASONABLE_INFERENCE
 
     # Rule 3: Text read from image OCR
-    if source == EvidenceSource.OCR:
+    if source in (EvidenceSource.OCR, EvidenceSource.PADDLE_OCR):
         conf = min(0.98, max(0.50, raw_confidence or 0.85))
         return round(conf, 2), UncertaintyStatus.CONFIRMED_OBSERVATION
 

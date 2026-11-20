@@ -1,4 +1,4 @@
-﻿"""
+"""
 Configuration validation and security tests.
 """
 import pytest
@@ -10,7 +10,8 @@ def test_default_development_config():
     """Verify standard development defaults behave properly."""
     settings = Settings(
         APP_ENV="development",
-        AI_SERVICE_SECRET="dev_internal_ai_service_secret_key_change_in_production_32b"
+        AI_SERVICE_SECRET="dev_internal_ai_service_secret_key_change_in_production_32b",
+        _env_file=None,
     )
     assert settings.PORT == 8000
     assert settings.APP_NAME == "BhartiyeCrafts-AI-Service"
