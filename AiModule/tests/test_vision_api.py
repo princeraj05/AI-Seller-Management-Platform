@@ -1,4 +1,4 @@
-﻿"""
+"""
 Integration tests for Vision and Product Intelligence API endpoints.
 """
 import io
@@ -108,7 +108,7 @@ def test_extract_attributes_success(client: TestClient, monkeypatch):
         processing_metadata={"test": True},
     )
 
-    async def mock_analyze(self, image_bytes, filename="product.jpg", enable_ocr=True, user_hint=None):
+    async def mock_analyze(self, image_bytes, filename="product.jpg", enable_ocr=True, user_hint=None, **kwargs):
         return mock_result
 
     monkeypatch.setattr(ProductIntelligenceService, "analyze_product", mock_analyze)

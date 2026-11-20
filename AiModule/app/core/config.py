@@ -60,6 +60,23 @@ class Settings(BaseSettings):
     OCR_ENABLED: bool = Field(default=True, description="Enable or disable OCR text extraction")
     OCR_LANGUAGE: str = Field(default="en", description="OCR language code (e.g., en, ch, etc.)")
 
+    # Phase 02.3: Performance & Optimization Settings
+    # Gemini Circuit Breaker & Fallback
+    GEMINI_PRIMARY_TIMEOUT: float = Field(default=10.0, description="Bounded timeout for primary Gemini model in seconds")
+    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-3.5-flash-lite", description="Reliable fast fallback Gemini model")
+    GEMINI_CIRCUIT_BREAKER_ENABLED: bool = Field(default=True, description="Enable circuit breaker for Gemini upstream demand spikes")
+    GEMINI_CIRCUIT_FAILURE_THRESHOLD: int = Field(default=3, description="Consecutive 503/504 failures before opening circuit")
+    GEMINI_CIRCUIT_COOLDOWN_SECONDS: float = Field(default=60.0, description="Cooldown seconds before attempting half-open probe")
+
+    # In-Memory Tenant-Safe Vision Cache
+    VISION_CACHE_ENABLED: bool = Field(default=True, description="Enable in-memory LRU/TTL vision results caching")
+    VISION_CACHE_TTL_SECONDS: int = Field(default=600, description="Time-to-live for cached vision results in seconds (10 mins)")
+    VISION_CACHE_MAX_ENTRIES: int = Field(default=500, description="Maximum entries in LRU vision cache")
+
+    # OCR Concurrency & Worker Settings
+    OCR_THREAD_TIMEOUT: float = Field(default=30.0, description="Maximum execution timeout for OCR worker thread in seconds")
+    OCR_WARMUP_ON_STARTUP: bool = Field(default=True, description="Whether to pre-warm OCR model weights at startup")
+
     # Phase 02: Image Processing & Validation Limits
     IMAGE_MAX_SIZE_MB: int = Field(default=10, description="Maximum allowed uploaded image file size in Megabytes")
     IMAGE_MAX_WIDTH: int = Field(default=4096, description="Maximum allowed width in pixels")

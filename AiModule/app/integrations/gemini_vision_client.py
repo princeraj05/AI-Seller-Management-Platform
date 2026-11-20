@@ -12,7 +12,97 @@ from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.schemas.vision import HandicraftVisionOutput
 
+import asyncio
+import threading
+
 logger = get_logger("integrations.gemini_vision_client")
+
+
+class CircuitState:
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class GeminiCircuitBreaker:
+    """
+    Tracks upstream Gemini service health.
+    If consecutive demand spikes (503/504) exceed failure_threshold, the circuit OPENS,
+    routing requests directly to the fast fallback model to prevent multi-second delays.
+    After cooldown_seconds, enters HALF_OPEN probe state for controlled recovery.
+    """
+
+    def __init__(self, failure_threshold: int = 3, cooldown_seconds: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    def should_bypass_primary(self) -> bool:
+        """Check if primary model should be bypassed due to open circuit."""
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return False
+
+            now = time.time()
+            if self.state == CircuitState.OPEN:
+                if now - self.last_failure_time >= self.cooldown_seconds:
+                    logger.info("Gemini circuit breaker cooldown expired; entering HALF_OPEN probe state.")
+                    self.state = CircuitState.HALF_OPEN
+                    return False  # Allow one probe to test primary
+                return True  # Bypass primary
+
+            # HALF_OPEN: allow current probe through
+            return False
+
+    def record_success(self):
+        """Record successful primary model response and reset circuit."""
+        with self._lock:
+            if self.state != CircuitState.CLOSED:
+                logger.info(f"Primary model probe succeeded; resetting circuit breaker from '{self.state}' to CLOSED.")
+            self.state = CircuitState.CLOSED
+            self.failure_count = 0
+
+    def record_failure(self, is_upstream_overload: bool = True):
+        """Record primary failure and evaluate transition to OPEN."""
+        with self._lock:
+            if not is_upstream_overload:
+                return
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+
+            if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
+                if self.state != CircuitState.OPEN:
+                    logger.warning(
+                        f"Gemini circuit breaker tripped to OPEN (consecutive failures={self.failure_count}, "
+                        f"threshold={self.failure_threshold}). Cooldown window: {self.cooldown_seconds}s."
+                    )
+                self.state = CircuitState.OPEN
+
+    def reset(self):
+        """Manually reset circuit breaker for test harnesses."""
+        with self._lock:
+            self.state = CircuitState.CLOSED
+            self.failure_count = 0
+            self.last_failure_time = 0.0
+
+
+# Module-level singleton circuit breaker
+_gemini_circuit_breaker: Optional[GeminiCircuitBreaker] = None
+
+
+def get_gemini_circuit_breaker() -> GeminiCircuitBreaker:
+    """Retrieve application-wide circuit breaker instance."""
+    global _gemini_circuit_breaker
+    if _gemini_circuit_breaker is None:
+        settings = get_settings()
+        _gemini_circuit_breaker = GeminiCircuitBreaker(
+            failure_threshold=settings.GEMINI_CIRCUIT_FAILURE_THRESHOLD,
+            cooldown_seconds=settings.GEMINI_CIRCUIT_COOLDOWN_SECONDS,
+        )
+    return _gemini_circuit_breaker
 
 HANDICRAFT_GEMINI_PROMPT = """You are an expert Indian handicraft product catalog specialist and computer vision analyst.
 Analyze the provided product image and describe its physical, visual, and stylistic characteristics.
@@ -34,12 +124,17 @@ class GeminiVisionClient:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         timeout: Optional[float] = None,
+        fallback_model: Optional[str] = None,
+        primary_timeout: Optional[float] = None,
     ):
         settings = get_settings()
         self.provider = "gemini"
         self.api_key = api_key if api_key is not None else settings.GEMINI_API_KEY
         self.model_name = model_name or settings.GEMINI_MODEL
         self.timeout = timeout if timeout is not None else settings.GEMINI_TIMEOUT
+        self.fallback_model = fallback_model or settings.GEMINI_FALLBACK_MODEL
+        self.primary_timeout = primary_timeout if primary_timeout is not None else settings.GEMINI_PRIMARY_TIMEOUT
+        self.circuit_breaker = get_gemini_circuit_breaker()
         self._client = None
 
     def is_configured(self) -> bool:
@@ -132,31 +227,83 @@ class GeminiVisionClient:
                 temperature=0.2,
             )
 
-            # Call async generate_content with primary model, falling back if temporary 503/504 demand spike
-            model_to_use = self.model_name
-            try:
-                response = await client.aio.models.generate_content(
-                    model=model_to_use,
-                    contents=[prompt, image_part],
-                    config=config,
+            # Check circuit breaker before attempting primary model
+            settings = get_settings()
+            should_bypass = (
+                settings.GEMINI_CIRCUIT_BREAKER_ENABLED
+                and self.circuit_breaker.should_bypass_primary()
+                and self.model_name != self.fallback_model
+            )
+
+            fallback_triggered = False
+            primary_error: Optional[str] = None
+
+            if should_bypass:
+                logger.info(
+                    f"Gemini circuit breaker is OPEN. Bypassing '{self.model_name}' and "
+                    f"directly dispatching to fast fallback model '{self.fallback_model}'."
                 )
-            except Exception as model_exc:
-                err_m = str(model_exc)
-                if ("503" in err_m or "UNAVAILABLE" in err_m or "504" in err_m or "DEADLINE_EXCEEDED" in err_m) and model_to_use != "gemini-3.5-flash-lite":
-                    fallback = "gemini-3.5-flash-lite"
-                    logger.warning(
-                        f"Primary Gemini model '{model_to_use}' temporarily unavailable due to demand spike ({err_m}). "
-                        f"Failing over to compatible multimodal model '{fallback}'..."
-                    )
-                    model_to_use = fallback
-                    response = await client.aio.models.generate_content(
+                model_to_use = self.fallback_model
+                fallback_triggered = True
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
                         model=model_to_use,
                         contents=[prompt, image_part],
                         config=config,
+                    ),
+                    timeout=self.timeout,
+                )
+            else:
+                model_to_use = self.model_name
+                try:
+                    # Bound primary attempt with primary_timeout so demand-spike stalls are caught quickly
+                    response = await asyncio.wait_for(
+                        client.aio.models.generate_content(
+                            model=model_to_use,
+                            contents=[prompt, image_part],
+                            config=config,
+                        ),
+                        timeout=self.primary_timeout,
                     )
-                else:
-                    raise model_exc
+                    self.circuit_breaker.record_success()
+                except Exception as model_exc:
+                    err_m = str(model_exc)
+                    primary_error = err_m
+                    is_overload = (
+                        isinstance(model_exc, asyncio.TimeoutError)
+                        or "503" in err_m
+                        or "UNAVAILABLE" in err_m
+                        or "504" in err_m
+                        or "DEADLINE_EXCEEDED" in err_m
+                    )
+                    self.circuit_breaker.record_failure(is_upstream_overload=is_overload)
 
+                    # Maximum 1 fallback attempt
+                    if is_overload and model_to_use != self.fallback_model:
+                        fallback_triggered = True
+                        logger.warning(
+                            f"Primary Gemini model '{model_to_use}' failed or timed out ({err_m}). "
+                            f"Attempting single fallback to '{self.fallback_model}'..."
+                        )
+                        model_to_use = self.fallback_model
+                        response = await asyncio.wait_for(
+                            client.aio.models.generate_content(
+                                model=model_to_use,
+                                contents=[prompt, image_part],
+                                config=config,
+                            ),
+                            timeout=self.timeout,
+                        )
+                    else:
+                        raise model_exc
+
+        except asyncio.TimeoutError as exc:
+            msg = f"Gemini vision inference timed out after {self.timeout}s."
+            logger.error(msg)
+            raise ExternalServiceError(
+                message=msg,
+                details={"provider": "gemini", "model": self.model_name, "timeout": self.timeout},
+            ) from exc
         except TimeoutError as exc:
             msg = f"Gemini vision inference timed out after {self.timeout}s."
             logger.error(msg)
@@ -207,6 +354,10 @@ class GeminiVisionClient:
             out_dict = validated.model_dump()
             out_dict["_duration_ms"] = duration_ms
             out_dict["_model_used"] = model_to_use
+            out_dict["_fallback_triggered"] = fallback_triggered
+            out_dict["_circuit_breaker_state"] = self.circuit_breaker.state
+            if primary_error:
+                out_dict["_primary_error"] = primary_error
             return out_dict
         except Exception as exc:
             logger.error(f"Failed to validate Gemini JSON output: {str(exc)} | Raw: {raw_text[:200]}")

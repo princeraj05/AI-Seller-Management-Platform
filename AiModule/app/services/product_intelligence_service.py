@@ -2,6 +2,7 @@
 Product Intelligence Service.
 Orchestrates computer vision, OCR text recognition, attribute extraction, and taxonomy categorization.
 """
+import asyncio
 import time
 from typing import Any, Dict, List, Optional
 from PIL import Image
@@ -9,6 +10,7 @@ from PIL import Image
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.utils.cache import get_vision_cache
 from app.integrations.gemini_vision_client import GeminiVisionClient
 from app.integrations.ollama_client import OllamaVisionClient
 from app.schemas.vision import (
@@ -228,54 +230,90 @@ class ProductIntelligenceService:
         filename: str = "product.jpg",
         enable_ocr: bool = True,
         user_hint: Optional[str] = None,
+        seller_id: Optional[str] = None,
+        store_id: Optional[str] = None,
     ) -> ProductIntelligenceResult:
         """
         Execute end-to-end product intelligence pipeline:
-        Image validation → Preprocessing → Vision Analysis → OCR → Category & Attribute Synthesis.
-        Handles Scenarios A, B, C, D graceful degradation.
+        Cache Lookup → Image validation & Preprocessing → Concurrent (Vision + OCR) → Category & Attribute Synthesis.
+        Guarantees tenant isolation and non-blocking worker thread execution.
         """
         start_total = time.perf_counter()
 
+        # 0. Tenant-Safe Cache Lookup
+        cache = get_vision_cache()
+        active_model = getattr(self.vision_client, "model_name", "gemini-3.8-flash")
+        cache_key = cache.generate_key(
+            image_bytes=image_bytes,
+            enable_ocr=enable_ocr,
+            user_hint=user_hint,
+            model_name=active_model,
+            seller_id=seller_id,
+            store_id=store_id,
+        )
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            logger.info(f"Serving cached vision result for seller='{seller_id}', store='{store_id}'")
+            cached_dict = cached_result.model_dump()
+            cached_dict["processing_metadata"]["cache_hit"] = True
+            cached_dict["processing_metadata"]["cached"] = True
+            cached_dict["processing_metadata"]["total_duration_ms"] = round((time.perf_counter() - start_total) * 1000, 2)
+            return ProductIntelligenceResult.model_validate(cached_dict)
+
+        # 1. Validation and Preprocessing
         pil_image, img_meta = validate_image_bytes(image_bytes, filename=filename)
         processed_img, jpeg_bytes, b64_img = preprocess_image(pil_image)
 
-        # 1. Vision Model Analysis
-        vision_data: Optional[Dict[str, Any]] = None
-        vision_error: Optional[str] = None
-        start_vision = time.perf_counter()
-
-        try:
+        # 2. Define concurrent coroutines for Vision and OCR
+        async def _execute_vision() -> Dict[str, Any]:
             if getattr(self.vision_client, "provider", "") == "gemini":
-                vision_data = await self.vision_client.analyze_product_image(
+                return await self.vision_client.analyze_product_image(
                     jpeg_bytes, mime_type="image/jpeg", user_hint=user_hint
                 )
             else:
                 try:
-                    vision_data = await self.vision_client.analyze_product_image(b64_img, user_hint=user_hint)
+                    return await self.vision_client.analyze_product_image(b64_img, user_hint=user_hint)
                 except TypeError:
-                    vision_data = await self.vision_client.analyze_product_image(jpeg_bytes, user_hint=user_hint)
-        except Exception as exc:
-            vision_error = str(exc)
-            logger.warning(f"Vision inference failed: {vision_error}")
+                    return await self.vision_client.analyze_product_image(jpeg_bytes, user_hint=user_hint)
 
-        vision_time_ms = round((time.perf_counter() - start_vision) * 1000, 2)
+        async def _execute_ocr() -> OcrResult:
+            return await self.ocr_service.extract_text_from_image(processed_img, enabled=enable_ocr)
 
-        # 2. OCR Extraction
-        ocr_result: Optional[OcrResult] = None
-        ocr_error: Optional[str] = None
-        try:
-            ocr_result = await self.ocr_service.extract_text_from_image(processed_img, enabled=enable_ocr)
-        except Exception as exc:
-            ocr_error = str(exc)
-            logger.warning(f"OCR service failed: {ocr_error}")
+        # 3. Parallel Execution: Run Gemini and PaddleOCR concurrently
+        start_concurrent = time.perf_counter()
+        vision_outcome, ocr_outcome = await asyncio.gather(
+            _execute_vision(),
+            _execute_ocr(),
+            return_exceptions=True,
+        )
+        concurrent_ms = round((time.perf_counter() - start_concurrent) * 1000, 2)
+
+        # 4. Safely unpack Vision outcome
+        if isinstance(vision_outcome, Exception):
+            vision_error = str(vision_outcome)
+            vision_data = None
+            vision_time_ms = concurrent_ms
+            logger.warning(f"Vision inference failed concurrently: {vision_error}")
+        else:
+            vision_error = None
+            vision_data = vision_outcome
+            vision_time_ms = float(vision_data.get("_duration_ms", concurrent_ms))
+
+        # 5. Safely unpack OCR outcome
+        if isinstance(ocr_outcome, Exception):
+            ocr_error = str(ocr_outcome)
             ocr_result = OcrResult(
                 status="failed",
                 extracted_text="",
                 segments=[],
                 segment_count=0,
                 engine="PaddleOCR",
-                execution_time_ms=0.0,
+                execution_time_ms=concurrent_ms,
             )
+            logger.warning(f"OCR inference failed concurrently: {ocr_error}")
+        else:
+            ocr_error = None
+            ocr_result = ocr_outcome
 
         # Evaluate Scenarios A, B, C, D
         vision_succeeded = vision_data is not None and isinstance(vision_data, dict)
@@ -330,12 +368,14 @@ class ProductIntelligenceService:
                 image_metadata=img_meta,
                 processing_metadata={
                     "total_duration_ms": total_time_ms,
+                    "concurrent_execution_ms": concurrent_ms,
                     "vision_duration_ms": vision_time_ms,
                     "ocr_duration_ms": ocr_result.execution_time_ms,
                     "vision_model": getattr(self.vision_client, "model_name", "unknown"),
                     "ocr_status": ocr_result.status,
                     "degraded_mode": "ocr_only",
                     "vision_error": vision_error,
+                    "cache_hit": False,
                 },
             )
 
@@ -364,7 +404,7 @@ class ProductIntelligenceService:
 
         total_time_ms = round((time.perf_counter() - start_total) * 1000, 2)
 
-        return ProductIntelligenceResult(
+        final_result = ProductIntelligenceResult(
             product_type=product_type,
             visual_description=vision_data.get("visual_description", ""),
             multiple_products_detected=multiple_detected,
@@ -375,9 +415,18 @@ class ProductIntelligenceService:
             image_metadata=img_meta,
             processing_metadata={
                 "total_duration_ms": total_time_ms,
+                "concurrent_execution_ms": concurrent_ms,
                 "vision_duration_ms": vision_time_ms,
                 "ocr_duration_ms": ocr_result.execution_time_ms,
                 "vision_model": vision_data.get("_model_used", getattr(self.vision_client, "model_name", "unknown")),
+                "fallback_triggered": vision_data.get("_fallback_triggered", False),
+                "circuit_breaker_state": vision_data.get("_circuit_breaker_state", "closed"),
                 "ocr_status": ocr_result.status,
+                "cache_hit": False,
+                "cached": False,
             },
         )
+
+        # Store in cache only on successful vision extraction
+        cache.set(cache_key, final_result)
+        return final_result

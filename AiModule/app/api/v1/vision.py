@@ -14,6 +14,7 @@ from app.schemas.common import BaseResponse
 from app.schemas.vision import ProductIntelligenceResult
 from app.services.ocr_service import get_ocr_service
 from app.services.product_intelligence_service import ProductIntelligenceService
+from app.utils.cache import get_vision_cache
 
 router = APIRouter(prefix="/vision", tags=["Vision & Product Intelligence"])
 
@@ -45,6 +46,8 @@ async def extract_product_attributes(
         filename=filename,
         enable_ocr=enable_ocr,
         user_hint=user_hint,
+        seller_id=context.seller_id,
+        store_id=context.store_id,
     )
 
     return BaseResponse[ProductIntelligenceResult](
@@ -102,6 +105,7 @@ async def get_vision_engine_status(
             "ocr_enabled": settings.OCR_ENABLED,
             "ocr_engine": "PaddleOCR",
             "ocr_library_installed": ocr_available,
+            "cache": get_vision_cache().get_stats(),
             "ready": vision_ready and ocr_available,
         },
         request_id=context.request_id,
