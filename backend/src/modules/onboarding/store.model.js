@@ -33,6 +33,11 @@ const storeSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
+    gstin: {
+      type: String,
+      trim: true,
+      default: '',
+    },
     categories: {
       type: [String],
       default: [],

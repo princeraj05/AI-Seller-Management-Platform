@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useOutletContext } from 'react-router-dom';
 import {
   TrendingUp,
   ShoppingBag,
@@ -20,10 +20,23 @@ import { getAnalyticsOverviewApi } from '../../services/analyticsService';
 import { getAiInsightsApi } from '../../services/aiIntelligenceService';
 
 export default function Dashboard() {
+  const outletContext = useOutletContext() || {};
+  const currentUser = outletContext.currentUser;
+  const currentStore = outletContext.currentStore;
   const [range, setRange] = useState('30d');
   const [overview, setOverview] = useState(null);
   const [aiInsights, setAiInsights] = useState([]);
   const [loading, setLoading] = useState(true);
+
+  const greetingLabel = (() => {
+    const hour = new Date().getHours();
+    if (hour < 12) return 'Good Morning';
+    if (hour < 17) return 'Good Afternoon';
+    return 'Good Evening';
+  })();
+
+  const sellerDisplayName = currentUser?.name || currentUser?.email?.split('@')[0] || 'Seller';
+  const storeDisplayName = currentStore?.businessName || currentUser?.storeName || '';
 
   const fetchDashboardData = async () => {
     setLoading(true);
@@ -45,7 +58,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchDashboardData();
-  }, [range]);
+  }, [range, currentUser?.id]);
 
   const salesVal = overview ? `₹ ${overview.totalSales}` : '₹ 0';
   const ordersVal = overview ? overview.totalOrders : 0;
@@ -60,10 +73,12 @@ export default function Dashboard() {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
-            Good Afternoon, Seller! 👋
+            {greetingLabel}, {sellerDisplayName}! 👋
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            "Smarter selling. Bigger growth. Powered by AI." Here's what's happening with your business today.
+            {storeDisplayName ? `${storeDisplayName} • ` : ''}
+            {currentUser?.email ? `${currentUser.email} • ` : ''}
+            Here's what's happening with your store today.
           </p>
         </div>
         <div className="flex items-center gap-3">

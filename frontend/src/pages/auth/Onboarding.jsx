@@ -1,23 +1,48 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Sparkles, ArrowRight, ArrowLeft, CheckCircle2, Store, ShoppingBag, BarChart2, Globe, Building } from 'lucide-react';
 import { submitOnboardingApi } from '../../services/onboardingService';
-import { registerApi } from '../../services/authService';
+import { registerApi, saveAuthSession } from '../../services/authService';
 
 export default function Onboarding() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const isRegisterMode = searchParams.get('mode') === 'register' || !localStorage.getItem('authToken');
+
+  const existingUser = (() => {
+    if (isRegisterMode) return null;
+    try {
+      return JSON.parse(localStorage.getItem('user') || 'null');
+    } catch {
+      return null;
+    }
+  })();
+
   const [step, setStep] = useState(1);
-  const [businessName, setBusinessName] = useState('Bhartiye Crafts');
-  const [ownerName, setOwnerName] = useState('Prince Kumar');
-  const [mobile, setMobile] = useState('+91 98765 43210');
-  const [email, setEmail] = useState('');
+  const [businessName, setBusinessName] = useState(existingUser?.storeName || '');
+  const [ownerName, setOwnerName] = useState(existingUser?.name || '');
+  const [mobile, setMobile] = useState('');
+  const [email, setEmail] = useState(existingUser?.email || '');
   const [password, setPassword] = useState('');
   const [selectedCategories, setSelectedCategories] = useState(['Fashion', 'Handicrafts']);
   const [selectedChannels, setSelectedChannels] = useState(['amazon', 'flipkart', 'myntra']);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
-  const isLoggedIn = Boolean(localStorage.getItem('authToken'));
+  const isLoggedIn = !isRegisterMode;
+
+  const handleStep2Continue = () => {
+    setErrorMsg('');
+    if (!businessName.trim() || !ownerName.trim() || !mobile.trim() || !email.trim()) {
+      setErrorMsg('Please fill in all required business details.');
+      return;
+    }
+    if (!isLoggedIn && (!password || password.length < 8)) {
+      setErrorMsg('Please choose a password with at least 8 characters.');
+      return;
+    }
+    setStep(3);
+  };
 
   const categoriesList = [
     { name: 'Fashion', desc: 'Clothing, Apparel & Accessories', icon: '👗' },
@@ -58,7 +83,8 @@ export default function Onboarding() {
     setErrorMsg('');
     setIsSubmitting(true);
     try {
-      // If user is not yet logged in, register first with real password
+      // If user is registering a new account, register first with real password
+      let registeredUser = existingUser;
       if (!isLoggedIn) {
         if (!password || password.length < 8) {
           setErrorMsg('Please choose a password with at least 8 characters');
@@ -68,29 +94,25 @@ export default function Onboarding() {
         }
 
         const regRes = await registerApi({
-          name: ownerName,
-          email,
+          name: ownerName.trim(),
+          email: email.trim(),
           password,
-          storeName: businessName,
+          storeName: businessName.trim(),
         });
 
         if (regRes.success && regRes.token) {
-          localStorage.setItem('authToken', regRes.token);
-          localStorage.removeItem('refreshToken');
-          sessionStorage.removeItem('refreshToken');
-          if (regRes.user) {
-            localStorage.setItem('user', JSON.stringify(regRes.user));
-          }
+          saveAuthSession(regRes.token, regRes.user);
+          registeredUser = regRes.user;
         } else {
           throw new Error(regRes.message || 'Registration failed');
         }
       }
 
       const payload = {
-        businessName,
-        ownerName,
-        mobile,
-        email,
+        businessName: businessName.trim(),
+        ownerName: ownerName.trim(),
+        mobile: mobile.trim(),
+        email: email.trim(),
         categories: selectedCategories,
         channels: selectedChannels,
       };
@@ -100,6 +122,14 @@ export default function Onboarding() {
         if (res.store) {
           localStorage.setItem('store', JSON.stringify(res.store));
         }
+        const updatedUser = {
+          ...(registeredUser || {}),
+          name: ownerName.trim(),
+          email: email.trim().toLowerCase(),
+          storeName: businessName.trim(),
+          onboardingCompleted: true,
+        };
+        localStorage.setItem('user', JSON.stringify(updatedUser));
         localStorage.setItem('onboardingCompleted', 'true');
         navigate('/');
       } else {
@@ -126,8 +156,13 @@ export default function Onboarding() {
               <p className="text-xs text-slate-500">Business Setup Wizard</p>
             </div>
           </div>
-          <div className="text-xs font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
-            Step {step} of 4
+          <div className="flex items-center gap-3">
+            <Link to="/login" className="text-xs font-semibold text-slate-500 hover:text-blue-600 transition-colors">
+              Already have an account? Sign in
+            </Link>
+            <div className="text-xs font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
+              Step {step} of 4
+            </div>
           </div>
         </div>
 
@@ -195,6 +230,7 @@ export default function Onboarding() {
                   type="text"
                   value={businessName}
                   onChange={(e) => setBusinessName(e.target.value)}
+                  placeholder="e.g. Sharma Handloom Studio"
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg"
                 />
               </div>
@@ -204,6 +240,7 @@ export default function Onboarding() {
                   type="text"
                   value={ownerName}
                   onChange={(e) => setOwnerName(e.target.value)}
+                  placeholder="Your full name"
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg"
                 />
               </div>
@@ -213,6 +250,7 @@ export default function Onboarding() {
                   type="text"
                   value={mobile}
                   onChange={(e) => setMobile(e.target.value)}
+                  placeholder="+91 98765 43210"
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg"
                 />
               </div>
@@ -244,7 +282,7 @@ export default function Onboarding() {
               <button onClick={() => setStep(1)} className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg flex items-center gap-1">
                 <ArrowLeft className="w-4 h-4" /> Back
               </button>
-              <button onClick={() => setStep(3)} className="bg-blue-600 text-white px-6 py-2 rounded-lg text-xs font-semibold flex items-center gap-1">
+              <button onClick={handleStep2Continue} className="bg-blue-600 text-white px-6 py-2 rounded-lg text-xs font-semibold flex items-center gap-1">
                 Continue <ArrowRight className="w-4 h-4" />
               </button>
             </div>

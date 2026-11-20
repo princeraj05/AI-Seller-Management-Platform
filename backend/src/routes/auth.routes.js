@@ -7,6 +7,7 @@ import {
   logoutUser,
   resetPassword,
   getMe,
+  updateMe,
 } from '../modules/users/user.controller.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { csrfProtection } from '../middleware/csrfMiddleware.js';
@@ -20,5 +21,6 @@ router.post('/refresh', csrfProtection, refreshAccessToken);
 router.post('/logout', csrfProtection, logoutUser);
 router.post('/reset-password', csrfProtection, resetPassword);
 router.get('/me', authMiddleware, getMe);
+router.put('/me', csrfProtection, authMiddleware, updateMe);
 
 export default router;

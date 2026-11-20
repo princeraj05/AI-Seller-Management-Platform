@@ -114,6 +114,27 @@ export const resetPasswordApi = async ({ email, currentPassword, newPassword }) 
 };
 
 /**
+ * Persist a fresh authenticated session and wipe any previous user's cached state
+ */
+export const saveAuthSession = (token, user = null) => {
+  localStorage.removeItem('refreshToken');
+  sessionStorage.removeItem('refreshToken');
+  localStorage.removeItem('store');
+  localStorage.removeItem('onboardingCompleted');
+  localStorage.removeItem('user');
+
+  if (token) {
+    localStorage.setItem('authToken', token);
+  }
+  if (user) {
+    localStorage.setItem('user', JSON.stringify(user));
+    if (user.onboardingCompleted) {
+      localStorage.setItem('onboardingCompleted', 'true');
+    }
+  }
+};
+
+/**
  * Get current authenticated user profile
  */
 export const getMeApi = async () => {
@@ -122,8 +143,26 @@ export const getMeApi = async () => {
     return response.data;
   } catch (error) {
     if (error.response && error.response.data) {
-      throw new Error(error.response.data.message || 'Failed to fetch user profile');
+      const err = new Error(error.response.data.message || 'Failed to fetch user profile');
+      err.status = error.response.status;
+      err.code = error.response.data.code;
+      throw err;
     }
     throw new Error(error.message || 'Network error fetching user profile');
+  }
+};
+
+/**
+ * Update current authenticated user profile & store info
+ */
+export const updateMeApi = async (profileData) => {
+  try {
+    const response = await api.put('/auth/me', profileData);
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(error.response.data.message || 'Failed to update profile');
+    }
+    throw new Error(error.message || 'Network error updating profile');
   }
 };

@@ -12,7 +12,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      default: 'Prince Admin',
+      default: 'Seller',
     },
     email: {
       type: String,
@@ -28,7 +28,7 @@ const userSchema = new mongoose.Schema(
     },
     storeName: {
       type: String,
-      default: 'My Super Seller Store',
+      default: 'My Seller Store',
     },
     storeId: {
       type: mongoose.Schema.Types.ObjectId,

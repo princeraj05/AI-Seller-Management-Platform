@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -29,7 +29,25 @@ import {
   X
 } from 'lucide-react';
 import { mockNotifications } from '../utils/mockData';
-import { logoutApi } from '../services/authService';
+import { logoutApi, getMeApi } from '../services/authService';
+
+const getInitials = (name, email) => {
+  const source = (name || email || 'S').trim();
+  const parts = source.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  }
+  return source.slice(0, 2).toUpperCase();
+};
+
+const readStoredJson = (key) => {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
 
 export default function DashboardLayout() {
   const location = useLocation();
@@ -37,11 +55,53 @@ export default function DashboardLayout() {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const [channelsOpen, setChannelsOpen] = useState(true);
+  const [currentUser, setCurrentUser] = useState(() => readStoredJson('user'));
+  const [currentStore, setCurrentStore] = useState(() => readStoredJson('store'));
+
+  const refreshUser = useCallback(async () => {
+    const token = localStorage.getItem('authToken');
+    if (!token) {
+      navigate('/login', { replace: true });
+      return;
+    }
+
+    try {
+      const res = await getMeApi();
+      if (res?.success && res.user) {
+        setCurrentUser(res.user);
+        localStorage.setItem('user', JSON.stringify(res.user));
+        if (res.store) {
+          setCurrentStore(res.store);
+          localStorage.setItem('store', JSON.stringify(res.store));
+        } else {
+          setCurrentStore(null);
+          localStorage.removeItem('store');
+        }
+      }
+    } catch (err) {
+      if (err.status === 401 || err.status === 403) {
+        await logoutApi();
+        navigate('/login', { replace: true });
+      }
+    }
+  }, [navigate]);
+
+  useEffect(() => {
+    refreshUser();
+  }, [refreshUser]);
 
   const handleLogout = async () => {
+    setShowProfileMenu(false);
+    setCurrentUser(null);
+    setCurrentStore(null);
     await logoutApi();
-    navigate('/login');
+    navigate('/login', { replace: true });
   };
+
+  const displayName = currentUser?.name || currentUser?.email?.split('@')[0] || 'Seller';
+  const displayEmail = currentUser?.email || '';
+  const displayStore = currentStore?.businessName || currentUser?.storeName || 'Seller Account';
+  const displayInitials = getInitials(displayName, displayEmail);
 
   const navItems = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard },
@@ -276,22 +336,36 @@ export default function DashboardLayout() {
                 onClick={() => setShowProfileMenu(!showProfileMenu)}
                 className="flex items-center gap-2 pl-2 hover:opacity-80 transition-opacity"
               >
-                <div className="w-9 h-9 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center">
-                  PR
-                </div>
+                {currentUser?.avatar ? (
+                  <img
+                    src={currentUser.avatar}
+                    alt={displayName}
+                    referrerPolicy="no-referrer"
+                    className="w-9 h-9 rounded-full object-cover border border-slate-200"
+                  />
+                ) : (
+                  <div className="w-9 h-9 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center">
+                    {displayInitials}
+                  </div>
+                )}
                 <div className="text-left hidden md:block">
-                  <span className="font-semibold text-xs text-slate-800 block leading-none">Prince Raj</span>
-                  <span className="text-[10px] text-slate-400 font-medium block mt-0.5">Seller Account</span>
+                  <span className="font-semibold text-xs text-slate-800 block leading-none">{displayName}</span>
+                  <span className="text-[10px] text-slate-400 font-medium block mt-0.5">{displayStore}</span>
                 </div>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
               </button>
 
               {/* Profile Dropdown Popover */}
               {showProfileMenu && (
-                <div className="absolute right-0 mt-2 w-56 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-40">
+                <div className="absolute right-0 mt-2 w-60 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-40">
                   <div className="px-4 py-2 border-b border-slate-100">
-                    <p className="font-bold text-xs text-slate-900">Prince Raj</p>
-                    <p className="text-[11px] text-slate-500">prince@seller.com</p>
+                    <p className="font-bold text-xs text-slate-900 truncate">{displayName}</p>
+                    <p className="text-[11px] text-slate-500 truncate">{displayEmail || 'No email set'}</p>
+                    {currentUser?.sellerId && (
+                      <p className="text-[10px] text-slate-400 font-mono mt-0.5 truncate">
+                        ID: {currentUser.sellerId}
+                      </p>
+                    )}
                   </div>
                   <Link
                     to="/settings"
@@ -326,7 +400,7 @@ export default function DashboardLayout() {
 
         {/* Nested Route Page Outlet */}
         <main className="flex-1 p-6 overflow-y-auto">
-          <Outlet />
+          <Outlet context={{ currentUser, currentStore, refreshUser }} />
         </main>
       </div>
     </div>

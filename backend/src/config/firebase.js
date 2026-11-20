@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 let firebaseAdminApp = null;
 
 try {
-  const jsonPath = path.resolve(__dirname, '../../', config.firebase.serviceAccountPath || '../ai-seller-management-platform-firebase-adminsdk-fbsvc-96293ddcb9.json');
+  const jsonPath = path.resolve(__dirname, '../../', config.firebase.serviceAccountPath || '../ai-seller-management-platform-firebase-adminsdk-fbsvc-34dc5d1f07.json');
   
   if (existsSync(jsonPath)) {
     const serviceAccount = JSON.parse(readFileSync(jsonPath, 'utf8'));

@@ -20,7 +20,7 @@ import {
   FileText,
   BarChart3
 } from 'lucide-react';
-import { loginApi, googleLoginApi, resetPasswordApi } from '../../services/authService';
+import { loginApi, googleLoginApi, resetPasswordApi, saveAuthSession } from '../../services/authService';
 import { auth, googleProvider } from '../../config/firebase';
 import { signInWithPopup } from 'firebase/auth';
 
@@ -52,16 +52,11 @@ export default function Login() {
     try {
       const res = await loginApi(email, password);
       if (res.success && res.token) {
-        localStorage.setItem('authToken', res.token);
-        localStorage.removeItem('refreshToken');
-        sessionStorage.removeItem('refreshToken');
-        if (res.user) {
-          localStorage.setItem('user', JSON.stringify(res.user));
-        }
-        setSuccessMsg('Sign in successful! Redirecting...');
+        saveAuthSession(res.token, res.user);
+        setSuccessMsg(`Welcome back, ${res.user?.name || email}! Redirecting...`);
         setTimeout(() => {
           navigate('/');
-        }, 800);
+        }, 600);
       } else {
         setErrorMsg(res.message || 'Login failed. Please check your credentials.');
       }
@@ -80,6 +75,7 @@ export default function Login() {
 
   const handleGoogleSignIn = async () => {
     setErrorMsg('');
+    setSuccessMsg('');
     try {
       if (!auth) {
         setErrorMsg('Google Sign-in is not configured. Please sign in with your email and password.');
@@ -87,20 +83,15 @@ export default function Login() {
       }
       setIsLoading(true);
       const result = await signInWithPopup(auth, googleProvider);
-      const idToken = await result.user.getIdToken();
+      const idToken = await result.user.getIdToken(true);
       if (idToken) {
         const res = await googleLoginApi(idToken);
         if (res.success && res.token) {
-          localStorage.setItem('authToken', res.token);
-          localStorage.removeItem('refreshToken');
-          sessionStorage.removeItem('refreshToken');
-          if (res.user) {
-            localStorage.setItem('user', JSON.stringify(res.user));
-          }
-          setSuccessMsg('Google sign-in successful! Redirecting...');
+          saveAuthSession(res.token, res.user);
+          setSuccessMsg(`Signed in as ${res.user?.name || res.user?.email}! Redirecting...`);
           setTimeout(() => {
             navigate('/');
-          }, 800);
+          }, 600);
         } else {
           setErrorMsg(res.message || 'Google sign-in failed. Please try again.');
         }
@@ -512,7 +503,7 @@ export default function Login() {
             {/* Create Account Link */}
             <p className="text-center text-xs text-slate-600 font-medium mt-6">
               Don't have an account?{' '}
-              <Link to="/onboarding" className="text-blue-600 font-bold hover:underline">
+              <Link to="/onboarding?mode=register" className="text-blue-600 font-bold hover:underline">
                 Create account
               </Link>
             </p>

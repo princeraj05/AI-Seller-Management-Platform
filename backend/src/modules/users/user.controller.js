@@ -97,7 +97,11 @@ export const loginWithGoogle = async (req, res) => {
         user.firebaseUid = uid;
         shouldSave = true;
       }
-      if (picture && !user.avatar) {
+      if (name && (!user.name || user.name === 'Prince Admin' || user.name === 'Seller')) {
+        user.name = name;
+        shouldSave = true;
+      }
+      if (picture && user.avatar !== picture) {
         user.avatar = picture;
         shouldSave = true;
       }
@@ -129,6 +133,7 @@ export const loginWithGoogle = async (req, res) => {
         id: user._id.toString(),
         name: user.name,
         email: user.email,
+        avatar: user.avatar || '',
         storeName: user.storeName,
         role: user.role,
         sellerId: user.sellerId || user._id.toString(),
@@ -187,6 +192,16 @@ export const loginUser = async (req, res) => {
       });
     }
 
+    // Google-only accounts without a local password set yet
+    if (!user.password) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'This account was created with Google Sign-In. Please click "Continue with Google" or use "Forgot password?" to set a password.',
+        code: 'GOOGLE_ACCOUNT_ONLY',
+      });
+    }
+
     // Migration Strategy for Legacy Plaintext Passwords:
     // If the existing user password is not bcrypt-hashed, reject login and require password reset
     if (user.password && !user.password.startsWith('$2a$') && !user.password.startsWith('$2b$')) {
@@ -222,6 +237,7 @@ export const loginUser = async (req, res) => {
         id: user._id.toString(),
         name: user.name,
         email: user.email,
+        avatar: user.avatar || '',
         storeName: user.storeName,
         role: user.role,
         sellerId: user.sellerId || user._id.toString(),
@@ -301,6 +317,7 @@ export const registerUser = async (req, res) => {
         id: user._id.toString(),
         name: user.name,
         email: user.email,
+        avatar: user.avatar || '',
         storeName: user.storeName,
         role: user.role,
         sellerId: user.sellerId || user._id.toString(),
@@ -549,6 +566,8 @@ export const getMe = async (req, res) => {
         firebaseUid: user.firebaseUid,
         name: user.name,
         email: user.email,
+        avatar: user.avatar || '',
+        storeName: store?.businessName || user.storeName || '',
         role: user.role,
         storeId: user.storeId || (store ? store._id : null),
         sellerId: user.sellerId,
@@ -559,5 +578,83 @@ export const getMe = async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @desc    Update current authenticated user profile & store info
+ * @route   PUT /api/auth/me
+ * @access  Private
+ */
+export const updateMe = async (req, res) => {
+  try {
+    const authUser = req.user;
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: 'Unauthenticated' });
+    }
+
+    const { name, storeName, businessName, mobile, gstin, supportEmail } = req.body;
+    const resolvedStoreName = (businessName || storeName || '').trim();
+
+    const user = await User.findById(authUser.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (name && name.trim()) {
+      user.name = name.trim();
+    }
+    if (resolvedStoreName) {
+      user.storeName = resolvedStoreName;
+    }
+
+    const sellerId = user.sellerId || user._id.toString();
+    let store = await Store.findOne({ sellerId });
+
+    if (store) {
+      if (resolvedStoreName) store.businessName = resolvedStoreName;
+      if (name && name.trim()) store.ownerName = name.trim();
+      if (mobile !== undefined) store.mobile = String(mobile).trim() || store.mobile;
+      if (gstin !== undefined) store.gstin = String(gstin).trim();
+      if (supportEmail && supportEmail.trim()) store.email = supportEmail.trim().toLowerCase();
+      await store.save();
+    } else if (resolvedStoreName) {
+      store = await Store.create({
+        ownerId: user._id,
+        sellerId,
+        businessName: resolvedStoreName,
+        ownerName: user.name,
+        mobile: (mobile && String(mobile).trim()) || 'Not set',
+        email: (supportEmail && supportEmail.trim().toLowerCase()) || user.email,
+        gstin: (gstin && String(gstin).trim()) || '',
+        onboardingCompleted: true,
+        status: 'active',
+      });
+      user.storeId = store._id;
+      user.onboardingCompleted = true;
+    }
+
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: {
+        id: user._id.toString(),
+        firebaseUid: user.firebaseUid || null,
+        name: user.name,
+        email: user.email,
+        avatar: user.avatar || '',
+        storeName: store?.businessName || user.storeName || '',
+        role: user.role,
+        storeId: user.storeId ? user.storeId.toString() : store ? store._id.toString() : null,
+        sellerId,
+        onboardingCompleted: Boolean(user.onboardingCompleted || (store && store.onboardingCompleted)),
+      },
+      store: store || null,
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to update profile' });
   }
 };
