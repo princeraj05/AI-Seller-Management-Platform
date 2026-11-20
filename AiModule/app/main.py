@@ -1,4 +1,4 @@
-﻿"""
+"""
 Main FastAPI Application Entrypoint for Bhartiye Crafts AI Microservice.
 Configures lifespan, middleware, routers, exception handlers, and observability.
 """
@@ -34,6 +34,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         f"Starting {active_settings.APP_NAME} in '{active_settings.APP_ENV}' mode on port {active_settings.PORT}"
     )
+    if active_settings.OCR_ENABLED and getattr(active_settings, "OCR_WARMUP_ON_STARTUP", False):
+        try:
+            from app.services.ocr_service import get_ocr_service
+            ocr_svc = get_ocr_service()
+            if ocr_svc.is_available():
+                import asyncio
+                asyncio.create_task(ocr_svc.warmup())
+        except Exception as exc:
+            logger.warning(f"Lifespan OCR warmup skipped: {exc}")
     yield
     logger.info(f"Shutting down {active_settings.APP_NAME}...")
     node_client = get_node_client()

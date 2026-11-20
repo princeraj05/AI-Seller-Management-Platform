@@ -1,4 +1,4 @@
-﻿# Bhartiye Crafts — Python AI/ML Microservice
+# Bhartiye Crafts — Python AI/ML Microservice
 
 Welcome to the independent AI/ML microservice for the **Bhartiye Crafts AI Seller Management Platform**.
 
@@ -223,26 +223,88 @@ Headers:
 
 ---
 
-## 9. Running Automated Tests
+## 9. Phase 02 / 02.2 — Computer Vision, OCR & Cloud Multimodal Intelligence Engine
+
+Phase 02 / 02.2 equips the microservice with cloud multimodal vision understanding (Google Gemini), local optical character recognition (PaddleOCR 2.8.1), and structured attribute normalization specifically calibrated for Indian handicraft products.
+
+### Architecture Highlights
+* **Primary Vision Provider**: Google Gemini (`google-genai` unified SDK, `gemini-2.0-flash`), delivering fast structured visual attribute extraction without requiring heavy local GPU resources.
+* **Optional Local Vision Provider**: Ollama (`qwen2.5-vl:7b`), preserved and switchable via `VISION_PROVIDER=ollama` for environments with dedicated GPUs.
+* **Local OCR Engine**: PaddleOCR 2.8.1 with PaddlePaddle 2.6.2 running deterministically on CPU, extracting brand labels, price tags, and packaging text in ~350ms.
+* **Resilient Multi-Scenario Degradation**:
+  * **Scenario A (Vision + OCR)**: Combines structured visual attributes with OCR label text.
+  * **Scenario B (Vision only)**: Operates seamlessly when OCR is disabled or fails, recording an uncertainty note.
+  * **Scenario C (OCR only)**: Falls back to OCR text extraction and catalog inference when vision provider is unavailable.
+  * **Scenario D (Both unavailable)**: Fails safely with structured `ExternalServiceError` without crashing the service.
+* **Calibrated Confidence & Evidence Tracking**:
+  * `gemini_vision` / `vision_model`: Visual observations (color, shape, visible texture).
+  * `paddle_ocr`: Ground-truth text extracted from labels and stamps.
+  * Texture-based materials are calibrated as `reasonable_inference` to prevent false claims of certified purity.
+
+### Provider Switching & Setup
+
+#### 1. Cloud Vision Setup (Recommended)
+Add your Gemini API key in `AiModule/.env`:
+```env
+VISION_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_TIMEOUT=60.0
+```
+
+#### 2. Optional Local Ollama Setup (GPU)
+```env
+VISION_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5-vl:7b
+```
+
+### API Endpoints
+
+#### `POST /api/v1/vision/extract-attributes`
+Extracts structured handicraft product intelligence from an uploaded image.
+
+* **Headers**:
+  * `X-Internal-Service-Key`: Internal microservice shared secret.
+  * `X-Seller-ID`: Authenticated seller identifier.
+* **Form-Data**:
+  * `file`: Product image (JPEG, PNG, WEBP, max 10MB).
+  * `enable_ocr`: Boolean (default `true`).
+  * `user_hint`: Optional seller hint (e.g., `"Handmade terracotta vase"`).
+
+#### `GET /api/v1/vision/status`
+Checks configuration, model readiness, and diagnostic status of both Gemini and Ollama providers, as well as the local PaddleOCR engine.
+
+---
+
+## 10. Running Automated Tests
 
 ```bash
 # Run pytest from inside AiModule
 python -m pytest -v
 ```
 
-The test suite covers:
-* Application startup & ASGI lifespan
+The test suite includes **61 automated tests** (all passing, 0 failing) covering:
+* Core application startup & ASGI lifespan
 * Liveness (`/health`) and readiness (`/health/ready`) probes
-* Pydantic configuration validation & production security checks
+* Pydantic configuration validation, provider switching & security checks
 * Internal service authentication & tenant context extraction
 * Node.js HTTP client requests, mock transport, timeouts, and error handling
+* Image validation, corruption handling, and Lanczos preprocessing
+* Google Gemini multimodal client: structured schema, timeouts, 403 invalid key, 429 quota exhaustion, malformed JSON
+* Ollama vision client parsing, timeout handling, and fallback behavior
+* PaddleOCR lazy loading, local inference, and graceful degradation
+* Product intelligence orchestration, category taxonomy, and multi-product flagging
+* Degradation handling across Scenarios A, B, C, and D
+* End-to-end Vision API endpoints (`/api/v1/vision/*`)
 
 ---
 
-## 10. Planned Future Modules
+## 11. Planned Future Modules
 
-* **Phase 02**: Vision, OCR & Product Intelligence Engine (Qwen3-VL / Ollama, PaddleOCR, attribute extraction)
 * **Phase 03**: Multi-Channel Listing & Schema Generator (Amazon SP-API, Flipkart, Meesho)
 * **Phase 04**: RAG Knowledge Engine (MongoDB Atlas Vector Search, Sentence Transformers)
 * **Phase 05**: Conversational AI Seller Assistant with Tool Calling
 * **Phase 06**: Business Intelligence, Trend Analysis & Automated Reports
+
+

@@ -15,6 +15,72 @@ const isProduction = nodeEnv === 'production';
 const jwtAccessSecret = process.env.JWT_ACCESS_SECRET;
 const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET;
 
+export const DEV_DEFAULT_AI_SECRET = 'dev_internal_ai_service_secret_key_change_in_production_32b';
+export const EXAMPLE_PLACEHOLDER_AI_SECRET = 'your_32_character_internal_service_secret_here';
+
+const INSECURE_PLACEHOLDER_SECRETS = new Set([
+  DEV_DEFAULT_AI_SECRET,
+  EXAMPLE_PLACEHOLDER_AI_SECRET,
+  'your_32_byte_secret_key_here',
+  'your_super_secret_jwt_access_key_min_32_chars_long',
+  'your_super_secret_jwt_refresh_key_min_32_chars_long',
+  'dev-insecure-jwt-access-secret-32-chars-long!',
+  'dev-insecure-jwt-refresh-secret-32-chars-long!',
+]);
+
+/**
+ * Validates and normalizes AI_SERVICE_SECRET.
+ * In production:
+ * - Rejects missing, empty, or whitespace-only secrets
+ * - Rejects secrets shorter than 32 characters after trimming
+ * - Rejects the development default secret (including whitespace-padded variations)
+ * - Rejects the documented example placeholder (including whitespace-padded variations)
+ * - Rejects other documented insecure placeholder values
+ * In development:
+ * - Falls back to DEV_DEFAULT_AI_SECRET if missing or empty
+ *
+ * @param {string|undefined|null} secret - Secret value from environment
+ * @param {boolean} [isProd=isProduction] - Production environment flag
+ * @returns {string} Normalized secret
+ */
+export const validateAiServiceSecret = (secret, isProd = isProduction) => {
+  const normalized = secret !== undefined && secret !== null ? String(secret).trim() : '';
+
+  if (isProd) {
+    if (!normalized) {
+      throw new Error('CRITICAL SECURITY ERROR: AI_SERVICE_SECRET must be set and non-empty in production.');
+    }
+    if (normalized.length < 32) {
+      throw new Error('CRITICAL SECURITY ERROR: AI_SERVICE_SECRET must be at least 32 characters long in production.');
+    }
+    if (normalized === DEV_DEFAULT_AI_SECRET) {
+      throw new Error('CRITICAL SECURITY ERROR: AI_SERVICE_SECRET cannot use the development default secret in production.');
+    }
+    if (normalized === EXAMPLE_PLACEHOLDER_AI_SECRET) {
+      throw new Error('CRITICAL SECURITY ERROR: AI_SERVICE_SECRET cannot use the example placeholder secret in production.');
+    }
+    if (INSECURE_PLACEHOLDER_SECRETS.has(normalized)) {
+      throw new Error('CRITICAL SECURITY ERROR: AI_SERVICE_SECRET cannot use a documented placeholder secret in production.');
+    }
+    return normalized;
+  }
+
+  return normalized || DEV_DEFAULT_AI_SECRET;
+};
+
+const aiServiceSecret = validateAiServiceSecret(process.env.AI_SERVICE_SECRET, isProduction);
+
+// Validate AI_SERVICE_TIMEOUT: defaults to 60000ms, must be a positive safe integer if provided
+const rawAiServiceTimeout = process.env.AI_SERVICE_TIMEOUT;
+let aiServiceTimeout = 60000;
+if (rawAiServiceTimeout !== undefined && rawAiServiceTimeout !== null && String(rawAiServiceTimeout).trim() !== '') {
+  const parsed = Number(rawAiServiceTimeout);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error('AI_SERVICE_TIMEOUT must be a positive safe integer representing milliseconds.');
+  }
+  aiServiceTimeout = parsed;
+}
+
 // In production, strictly enforce strong, separate secrets
 if (isProduction) {
   if (!jwtAccessSecret || jwtAccessSecret.length < 32) {
@@ -81,6 +147,11 @@ export const config = {
   ai: {
     openaiApiKey: process.env.OPENAI_API_KEY || '',
     geminiApiKey: process.env.GEMINI_API_KEY || '',
+  },
+  aiService: {
+    url: (process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, ''),
+    secret: aiServiceSecret,
+    timeout: aiServiceTimeout,
   },
   amazon: {
     clientId: process.env.AMAZON_SP_API_CLIENT_ID || '',

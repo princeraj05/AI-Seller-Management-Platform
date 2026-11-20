@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pytest configuration and shared fixtures for Bhartiye Crafts AI Service test suite.
 """
 import pytest
@@ -6,6 +6,15 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings, get_settings
 from app.main import create_application
+from app.utils.cache import get_vision_cache
+
+
+@pytest.fixture(autouse=True)
+def reset_vision_cache():
+    """Clear vision cache before and after each test to ensure test isolation."""
+    get_vision_cache().clear()
+    yield
+    get_vision_cache().clear()
 
 
 @pytest.fixture

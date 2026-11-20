@@ -1,14 +1,18 @@
 ﻿"""
 API v1 Central Router.
-Mounts modular sub-routers for future AI capabilities and provides foundation endpoints.
+Mounts modular sub-routers for AI capabilities and provides foundation endpoints.
 """
 from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_request_context, require_seller_context
+from app.api.v1.vision import router as vision_router
 from app.core.security import RequestContext
 from app.schemas.common import BaseResponse
 
 router = APIRouter(prefix="/api/v1", tags=["API v1"])
+
+# Mount Phase 02 Vision & Product Intelligence Sub-Router
+router.include_router(vision_router)
 
 
 @router.get("/verify-auth", response_model=BaseResponse[dict])
@@ -50,11 +54,3 @@ async def verify_seller_context(
         },
         request_id=context.request_id,
     )
-
-# Note: Future sub-routers for Vision, Listings, RAG, Assistant, and Analytics
-# will be registered here as:
-# router.include_router(vision_router, prefix="/vision", tags=["Vision"])
-# router.include_router(listings_router, prefix="/listings", tags=["Listings"])
-# router.include_router(assistant_router, prefix="/assistant", tags=["Assistant"])
-# router.include_router(rag_router, prefix="/rag", tags=["RAG"])
-# router.include_router(analytics_router, prefix="/analytics", tags=["Analytics"])
