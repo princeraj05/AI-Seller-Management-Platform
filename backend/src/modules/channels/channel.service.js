@@ -3,6 +3,7 @@ import { ChannelConnection } from './channelConnection.model.js';
 import { SyncHistory } from './syncHistory.model.js';
 import { MarketplaceListing } from './marketplaceListing.model.js';
 import { Product } from '../products/product.model.js';
+import { inMemoryProductsMap } from '../products/product.service.js';
 import {
   encryptCredentials,
   decryptCredentials,
@@ -266,7 +267,11 @@ export const publishProductToChannelService = async (tenant, productId, channelI
   try {
     product = await Product.findOne({ sellerId, _id: productId });
   } catch (err) {
-    console.warn('DB product lookup for publishing failed/bypassed:', err.message);
+    product = inMemoryProductsMap.get(productId);
+  }
+
+  if (!product) {
+    product = inMemoryProductsMap.get(productId);
   }
 
   if (!product) {
@@ -282,6 +287,16 @@ export const publishProductToChannelService = async (tenant, productId, channelI
 
   if (!conn) {
     throw new Error('Channel connection not found');
+  }
+
+  const provider = String(conn.provider || '').toUpperCase();
+  if (provider === 'AMAZON') {
+    const error = new Error(
+      'Direct Amazon publishing via legacy route is disabled. Please use the authoritative Amazon SP-API workflow at /api/channels/amazon/listings/submissions.'
+    );
+    error.code = 'AMAZON_LEGACY_PUBLISHING_DISABLED';
+    error.statusCode = 400;
+    throw error;
   }
 
   const rawCredentials = decryptCredentials(conn.credentials) || {};

@@ -48,6 +48,7 @@ import {
   submitAmazonListing,
   getAmazonListingSubmissions,
   getAmazonListingSubmissionById,
+  getMarketplaceListingStatusSummary,
 } from './channel.controller.js';
 import { authMiddleware } from '../../middleware/authMiddleware.js';
 import { tenantMiddleware } from '../../middleware/tenantMiddleware.js';
@@ -114,6 +115,9 @@ router.get('/amazon/returns', getAmazonReturns);
 router.get('/amazon/returns/status', getAmazonReturnsStatus);
 router.get('/amazon/returns/:returnId', getAmazonReturnById);
 router.post('/amazon/returns/sync', triggerAmazonReturnsSync);
+
+// Batch Marketplace Status Aggregation Endpoint (declared before /:id)
+router.get('/marketplace-status', getMarketplaceListingStatusSummary);
 
 router.get('/health', getChannelHealth);
 router.get('/', getChannels);

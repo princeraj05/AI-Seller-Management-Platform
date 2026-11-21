@@ -427,7 +427,10 @@ export const getProductByIdService = async (sellerId, productId) => {
     if (p && p.sellerId === sellerId) {
       return p;
     }
-    throw new Error('Product not found or unauthorized');
+    const notFoundErr = new Error('Product not found or unauthorized');
+    notFoundErr.status = 404;
+    notFoundErr.code = 'NOT_FOUND';
+    throw notFoundErr;
   }
 
   return product;

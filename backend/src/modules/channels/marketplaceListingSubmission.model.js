@@ -22,6 +22,11 @@ const marketplaceListingSubmissionSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    storeId: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+      index: true,
+    },
     channelConnectionId: {
       type: mongoose.Schema.Types.Mixed,
       ref: 'ChannelConnection',

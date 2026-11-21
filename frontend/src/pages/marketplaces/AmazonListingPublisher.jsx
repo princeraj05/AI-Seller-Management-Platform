@@ -25,7 +25,8 @@ import {
   X,
   Plus,
   Trash2,
-  ListFilter
+  ListFilter,
+  Sparkles,
 } from 'lucide-react';
 import {
   getAmazonEligibleProductsApi,
@@ -38,6 +39,8 @@ import {
   getAmazonListingSubmissionByIdApi,
 } from '../../services/channelService';
 import { resolveProductImageUrl } from '../../utils/imageUrl';
+import { useSearchParams } from 'react-router-dom';
+import { getProductByIdApi } from '../../services/productService';
 
 function ProductThumbnail({ src, alt, className = '', iconClassName = 'w-6 h-6 text-slate-400' }) {
   const [hasError, setHasError] = useState(false);
@@ -77,7 +80,9 @@ function ProductThumbnail({ src, alt, className = '', iconClassName = 'w-6 h-6 t
   );
 }
 
-export default function AmazonListingPublisher({ connection, onListingCreated }) {
+export default function AmazonListingPublisher({ connection, onListingCreated, initialProductId }) {
+  const [searchParams] = useSearchParams();
+  const targetProductId = (initialProductId || searchParams.get('productId') || '').trim();
   const [subView, setSubView] = useState('wizard'); // 'wizard' | 'history'
   const [wizardStep, setWizardStep] = useState(1); // 1 to 7
 
@@ -90,7 +95,7 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
   // Product types
   const [productTypes, setProductTypes] = useState([]);
   const [productTypesLoading, setProductTypesLoading] = useState(false);
-  const [selectedProductType, setSelectedProductType] = useState('SHIRT');
+  const [selectedProductType, setSelectedProductType] = useState('');
   const [schemaData, setSchemaData] = useState(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
 
@@ -113,9 +118,9 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
     categoryAttributes: {
       color: '',
       size: '',
-      material: '100% Cotton',
-      targetGender: 'unisex',
-      department: 'men',
+      material: '',
+      targetGender: '',
+      department: '',
     },
   });
 
@@ -141,7 +146,18 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
       return;
     }
     const trimmed = formData.mainImage.trim();
-    const isDevAsset = trimmed.startsWith('/uploads/') || trimmed.startsWith('http://localhost');
+    const lower = trimmed.toLowerCase();
+    if (lower.startsWith('blob:') || lower.startsWith('data:') || lower.startsWith('file:') || /^[a-zA-Z]:[\\/]/.test(trimmed)) {
+      setMainImageState('broken');
+      setMainImageError('Amazon rejects blob:, data:, and local filesystem paths. Images must be public HTTPS URLs.');
+      return;
+    }
+    if (lower.startsWith('http://')) {
+      setMainImageState('broken');
+      setMainImageError('Amazon requires secure HTTPS image links. Insecure HTTP is rejected.');
+      return;
+    }
+    const isDevAsset = trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/');
     if (!trimmed.startsWith('https://') && !isDevAsset) {
       setMainImageState('broken');
       setMainImageError('Amazon requires secure HTTPS image links (e.g. Cloudinary or S3) or local upload assets.');
@@ -284,27 +300,28 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
     const mainImg = typeof imgList[0] === 'string' ? imgList[0] : (imgList[0]?.secure_url || imgList[0]?.url || '');
     const otherImgs = imgList.slice(1).map((img) => (typeof img === 'string' ? img : img?.secure_url || img?.url)).filter(Boolean);
 
-    // Guess product type based on category
-    let guessedType = 'SHIRT';
-    const catLower = (prodCategory || '').toLowerCase();
-    if (catLower.includes('shoe') || catLower.includes('footwear')) guessedType = 'SHOES';
-    else if (catLower.includes('bag') || catLower.includes('luggage')) guessedType = 'BAG';
-    else if (catLower.includes('jewel')) guessedType = 'JEWELRY';
-    else if (catLower.includes('home') || catLower.includes('bed')) guessedType = 'HOME_BED_AND_BATH';
-    else if (catLower.includes('elect')) guessedType = 'CONSUMER_ELECTRONICS';
+    // Product Type: prioritize master product definition; never default to SHIRT
+    const existingType = (prod.productType || '').trim().toUpperCase();
+    setSelectedProductType(existingType);
 
-    setSelectedProductType(guessedType);
+    // Bullet points: prioritize master product bulletPoints
+    const existingBullets = Array.isArray(prod.bulletPoints) && prod.bulletPoints.filter(Boolean).length > 0
+      ? prod.bulletPoints.filter(Boolean)
+      : [
+          `Premium quality ${prodTitle} crafted with care`,
+          `Authentic ${prodBrand} product designed for durability`,
+          `High quality finish and material`,
+        ];
+
+    // Attributes map / object resolution
+    const attrObj = prod.attributes && typeof prod.attributes === 'object' ? prod.attributes : {};
 
     setFormData({
       title: prodTitle,
       brand: prodBrand,
       sellerSku: prodSku ? `AMZ-${prodSku}` : `AMZ-${Date.now()}`,
       description: prod.description || `High quality ${prodTitle}`,
-      bulletPoints: [
-        `Premium quality material designed for durability`,
-        `Comfortable fit and finish suitable for daily use`,
-        `Authentic ${prodBrand} product crafted with care`,
-      ],
+      bulletPoints: existingBullets,
       mainImage: mainImg,
       otherImages: otherImgs,
       price: prod.masterPrice ? String(prod.masterPrice) : (prod.price ? String(prod.price) : '800'),
@@ -313,18 +330,71 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
       externalProductId: prod.barcode || '',
       externalProductIdType: prod.barcode ? 'EAN' : '',
       gtinExemptionRequested: !prod.barcode,
-      countryOfOrigin: 'IN',
+      countryOfOrigin: attrObj.countryOfOrigin || attrObj.country_of_origin || 'IN',
       categoryAttributes: {
-        color: prod.attributes?.color || prod.color || 'Black',
-        size: prod.attributes?.size || prod.size || 'M',
-        material: prod.attributes?.material || prod.material || '100% Cotton',
-        targetGender: 'unisex',
-        department: 'men',
+        color: attrObj.color || prod.color || '',
+        size: attrObj.size || prod.size || '',
+        material: attrObj.material || prod.material || '',
+        targetGender: attrObj.targetGender || attrObj.gender || '',
+        department: attrObj.department || '',
       },
     });
 
     setWizardStep(2);
   };
+
+  // Auto-select targeted product from direct navigation, page refresh, or URL searchParams
+  useEffect(() => {
+    if (!targetProductId) return;
+
+    let isMounted = true;
+
+    const selectTargetProduct = async () => {
+      try {
+        setProductsLoading(true);
+        // 1. Check if already present in products list
+        const found = products.find(
+          (p) => String(p._id || p.id) === String(targetProductId)
+        );
+        if (found) {
+          if (isMounted) handleSelectProduct(found);
+          return;
+        }
+
+        // 2. Fetch directly by ID (handles deep link, refresh, and non-paginated items)
+        const res = await getProductByIdApi(targetProductId);
+        const prod = res?.data?.product || res?.product || res?.data || res;
+        if (prod && (prod._id || prod.id)) {
+          if (isMounted) {
+            setProducts((prev) => {
+              const exists = prev.some((p) => String(p._id || p.id) === String(targetProductId));
+              return exists ? prev : [prod, ...prev];
+            });
+            handleSelectProduct(prod);
+          }
+        } else {
+          if (isMounted) {
+            setErrorMessage(`Product "${targetProductId}" not found or unavailable for publishing.`);
+            setWizardStep(1);
+          }
+        }
+      } catch (err) {
+        if (isMounted) {
+          console.warn('Could not load targeted product for Amazon publishing:', err.message);
+          setErrorMessage(`Unable to load product "${targetProductId}": ${err.message}. Please select a product from the catalogue below.`);
+          setWizardStep(1);
+        }
+      } finally {
+        if (isMounted) setProductsLoading(false);
+      }
+    };
+
+    selectTargetProduct();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [targetProductId, products.length]);
 
   const handleValidate = async () => {
     try {
@@ -635,6 +705,16 @@ export default function AmazonListingPublisher({ connection, onListingCreated })
                                 <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">
                                   Stock: {prodStock}
                                 </span>
+                                {prod.aiApproved && (
+                                  <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
+                                    <Sparkles className="w-2.5 h-2.5 text-emerald-600" /> AI Approved
+                                  </span>
+                                )}
+                                {prod.productType && (
+                                  <span className="text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded font-mono truncate max-w-[90px]">
+                                    {prod.productType}
+                                  </span>
+                                )}
                                 {prodCategory && (
                                   <span className="text-[10px] bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded truncate max-w-[100px]">
                                     {prodCategory}

@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { validateConnectChannelInput } from './channel.validator.js';
 import {
   connectChannelService,
@@ -61,6 +62,8 @@ import { inMemoryReturnsMap } from '../returns/return.service.js';
 import { Order } from '../orders/order.model.js';
 import { inMemoryOrdersMap } from '../orders/order.service.js';
 import { Product } from '../products/product.model.js';
+import { inMemoryProductsMap } from '../products/product.service.js';
+import { isProductionEnv } from '../../config/storage.js';
 import { MarketplaceListingSubmission } from './marketplaceListingSubmission.model.js';
 import {
   searchProductTypes,
@@ -140,10 +143,23 @@ export const syncChannel = async (req, res) => {
 export const publishProductToChannel = async (req, res) => {
   try {
     const { productId, channelId } = req.params;
+    if (channelId && String(channelId).toUpperCase() === 'AMAZON') {
+      return errorResponse(
+        res,
+        400,
+        'Direct Amazon publishing via legacy route is disabled. Please use the authoritative Amazon SP-API workflow at /api/channels/amazon/listings/submissions.',
+        'AMAZON_LEGACY_PUBLISHING_DISABLED'
+      );
+    }
     const result = await publishProductToChannelService(req.tenant, productId, channelId);
     return successResponse(res, 200, 'Product published to channel successfully', result);
   } catch (error) {
-    return errorResponse(res, 400, error.message || 'Failed to publish product to channel');
+    return errorResponse(
+      res,
+      error.statusCode || 400,
+      error.message || 'Failed to publish product to channel',
+      error.code
+    );
   }
 };
 
@@ -966,26 +982,117 @@ export const getAmazonReturnsStatus = async (req, res) => {
  */
 
 /**
+ * Helper to determine whether a product is eligible for marketplace publishing
+ * - Rejects Draft and Archived products
+ * - AI products require verified seller approval (aiApproved === true)
+ * - Manual products require active status
+ */
+export const isProductEligibleForPublishing = (product) => {
+  if (!product) return false;
+  if (product.status === 'Draft' || product.status === 'Archived') return false;
+
+  // AI-generated products require explicit seller approval
+  if (product.aiGenerated || product.aiJobId) {
+    return Boolean(product.aiApproved);
+  }
+
+  // Manual products require aiGenerated === false (or falsy) and status === 'Active'
+  const isManual = !product.aiGenerated && !product.aiJobId;
+  return isManual && product.status === 'Active';
+};
+
+/**
+ * Sanitize eligible product for marketplace listing publishing
+ * Strips confidential costPrice and internal tenant IDs
+ */
+export const sanitizeEligibleProduct = (prod) => {
+  if (!prod) return null;
+  const doc = typeof prod.toObject === 'function' ? prod.toObject() : { ...prod };
+  delete doc.costPrice;
+  delete doc.sellerId;
+  delete doc.storeId;
+  delete doc.tenantId;
+  delete doc.__v;
+
+  let attributesObj = {};
+  if (doc.attributes instanceof Map) {
+    doc.attributes.forEach((val, key) => {
+      attributesObj[key] = val;
+    });
+  } else if (doc.attributes && typeof doc.attributes === 'object') {
+    attributesObj = { ...doc.attributes };
+  }
+
+  return {
+    _id: doc._id ? String(doc._id) : (doc.id ? String(doc.id) : ''),
+    sku: doc.sku || '',
+    title: doc.title || doc.name || '',
+    description: doc.description || '',
+    shortDescription: doc.shortDescription || '',
+    bulletPoints: Array.isArray(doc.bulletPoints) ? doc.bulletPoints : [],
+    productType: doc.productType || '',
+    categoryName: doc.categoryName || doc.category || '',
+    subcategory: doc.subcategory || '',
+    brand: doc.brand || '',
+    material: doc.material || '',
+    color: doc.color || '',
+    attributes: attributesObj,
+    images: Array.isArray(doc.images)
+      ? doc.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean)
+      : [],
+    masterPrice: doc.masterPrice !== undefined ? Number(doc.masterPrice) : Number(doc.price || 0),
+    stock: doc.stock !== undefined ? Number(doc.stock) : 0,
+    aiGenerated: Boolean(doc.aiGenerated),
+    aiApproved: Boolean(doc.aiApproved),
+    status: doc.status || 'Active',
+    barcode: doc.barcode || '',
+  };
+};
+
+/**
  * Get eligible products from central catalogue for Amazon listing
  * @route GET /api/channels/amazon/products/eligible
  */
 export const getEligibleCatalogueProducts = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId } = req.tenant;
     const { q, page = 1, limit = 20 } = req.query;
 
     const pageNum = Math.max(Number(page) || 1, 1);
     const limitNum = Math.min(Math.max(Number(limit) || 20, 1), 100);
     const skip = (pageNum - 1) * limitNum;
 
-    const query = { sellerId };
+    const query = {
+      sellerId,
+      status: { $nin: ['Draft', 'Archived'] },
+      $or: [
+        { aiGenerated: true, aiApproved: true },
+        { aiGenerated: { $ne: true }, aiJobId: null },
+      ],
+    };
+
+    if (storeId) {
+      query.storeId = storeId.toString();
+    } else {
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { storeId: null },
+          { storeId: { $exists: false } },
+          { storeId: '' },
+        ],
+      });
+    }
+
     if (q && q.trim()) {
       const cleanQ = q.trim();
-      query.$or = [
+      const searchOr = [
         { title: { $regex: cleanQ, $options: 'i' } },
         { sku: { $regex: cleanQ, $options: 'i' } },
         { brand: { $regex: cleanQ, $options: 'i' } },
       ];
+      query.$and = query.$and || [];
+      query.$and.push({ $or: searchOr });
     }
 
     let products = [];
@@ -996,13 +1103,39 @@ export const getEligibleCatalogueProducts = async (req, res) => {
         Product.countDocuments(query),
       ]);
     } catch (dbErr) {
-      // In-memory fallback if database query times out
-      products = [];
-      total = 0;
+      // Production MongoDB failures must return an appropriate 503 Service Unavailable response
+      if (isProductionEnv()) {
+        return errorResponse(
+          res,
+          503,
+          'Service Unavailable: Catalogue database is currently inaccessible. In-memory fallbacks are permanently disabled in production.'
+        );
+      }
+      // Non-production test/development fallback
+      const memList = Array.from(inMemoryProductsMap.values()).filter((p) => {
+        const matchesSeller = String(p.sellerId || p.seller) === String(sellerId);
+        const prodStore = p.storeId ? String(p.storeId) : null;
+        const reqStore = storeId ? String(storeId) : null;
+        const matchesStore = prodStore === reqStore;
+        const matchesApproval = isProductEligibleForPublishing(p);
+        let matchesQuery = true;
+        if (q && q.trim()) {
+          const lq = q.trim().toLowerCase();
+          matchesQuery =
+            (p.title || p.name || '').toLowerCase().includes(lq) ||
+            (p.sku || '').toLowerCase().includes(lq) ||
+            (p.brand || '').toLowerCase().includes(lq);
+        }
+        return matchesSeller && matchesStore && matchesApproval && matchesQuery;
+      });
+      total = memList.length;
+      products = memList.slice(skip, skip + limitNum);
     }
 
+    const sanitizedProducts = products.map(sanitizeEligibleProduct);
+
     return successResponse(res, 200, 'Eligible catalogue products retrieved successfully', {
-      products,
+      products: sanitizedProducts,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -1058,16 +1191,34 @@ export const getAmazonProductTypeSchema = async (req, res) => {
  */
 export const validateAmazonListing = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const sellerId = req.tenant?.sellerId?.toString();
+    const storeId = req.tenant?.storeId ? req.tenant.storeId.toString() : null;
     const { productId, mappedAttributes, productType, gtinExemption, gtinExemptionRequested, sellerSku } = req.body;
 
     if (!productId) {
       return errorResponse(res, 400, 'productId is required for listing validation');
     }
 
+    if (!productType || !productType.trim()) {
+      return errorResponse(
+        res,
+        400,
+        'Amazon Product Type is required. Please select a valid product type definition.',
+        'MISSING_PRODUCT_TYPE'
+      );
+    }
+    const cleanProductType = productType.trim().toUpperCase();
+
+    const productQuery = { _id: productId, sellerId };
+    if (storeId) {
+      productQuery.storeId = storeId;
+    } else {
+      productQuery.$or = [{ storeId: null }, { storeId: { $exists: false } }, { storeId: '' }];
+    }
+
     let product = null;
     try {
-      product = await Product.findOne({ _id: productId, sellerId }).lean();
+      product = await Product.findOne(productQuery).lean();
     } catch (e) {
       // fallback
     }
@@ -1081,14 +1232,14 @@ export const validateAmazonListing = async (req, res) => {
     const validation = validateListingData({
       product,
       mappedAttributes: mappedAttributes || {},
-      productType: productType || 'SHIRT',
+      productType: cleanProductType,
       gtinExemption: isExempt,
     });
 
     const payloadPreview = buildSpApiListingPayload({
       product,
       mappedAttributes: mappedAttributes || {},
-      productType: productType || 'SHIRT',
+      productType: cleanProductType,
       marketplaceId: req.body.marketplaceId || 'A21TJRUUN4KGV',
       sellerSku: sellerSku || product.sku,
       gtinExemption: isExempt,
@@ -1113,7 +1264,8 @@ export const validateAmazonListing = async (req, res) => {
  */
 export const createOrUpdateAmazonListingSubmission = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const sellerId = req.tenant?.sellerId?.toString();
+    const storeId = req.tenant?.storeId ? req.tenant.storeId.toString() : null;
     const {
       productId,
       productType,
@@ -1128,9 +1280,26 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
       return errorResponse(res, 400, 'productId is required');
     }
 
+    if (!productType || !productType.trim()) {
+      return errorResponse(
+        res,
+        400,
+        'Amazon Product Type is required before creating a listing submission.',
+        'MISSING_PRODUCT_TYPE'
+      );
+    }
+    const cleanProductType = productType.trim().toUpperCase();
+
+    const productQuery = { _id: productId, sellerId };
+    if (storeId) {
+      productQuery.storeId = storeId;
+    } else {
+      productQuery.$or = [{ storeId: null }, { storeId: { $exists: false } }, { storeId: '' }];
+    }
+
     let product = null;
     try {
-      product = await Product.findOne({ _id: productId, sellerId }).lean();
+      product = await Product.findOne(productQuery).lean();
     } catch (e) {
       // fallback
     }
@@ -1166,14 +1335,14 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
     const validation = validateListingData({
       product,
       mappedAttributes,
-      productType: productType || 'SHIRT',
+      productType: cleanProductType,
       gtinExemption: Boolean(gtinExemptionRequested),
     });
 
     const payloadPreview = buildSpApiListingPayload({
       product,
       mappedAttributes,
-      productType: productType || 'SHIRT',
+      productType: cleanProductType,
       marketplaceId,
       sellerSku: cleanSku,
       gtinExemption: Boolean(gtinExemptionRequested),
@@ -1184,13 +1353,14 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
     const submissionData = {
       sellerId: sellerId.toString(),
       tenantId: sellerId.toString(),
+      storeId: storeId ? storeId.toString() : null,
       channelConnectionId,
       provider: 'AMAZON',
       marketplaceId,
       environment: 'sandbox',
       productId: product._id.toString(),
       sellerSku: cleanSku,
-      productType: (productType || 'SHIRT').trim().toUpperCase(),
+      productType: cleanProductType,
       mappedAttributes,
       payloadPreview,
       status: initialStatus,
@@ -1208,6 +1378,9 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
         sellerSku: cleanSku,
         environment: 'sandbox',
       };
+      if (storeId) {
+        filter.storeId = storeId.toString();
+      }
       doc = await MarketplaceListingSubmission.findOneAndUpdate(
         filter,
         { $set: submissionData },
@@ -1276,7 +1449,8 @@ export const submitAmazonListing = async (req, res) => {
  */
 export const getAmazonListingSubmissions = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const sellerId = req.tenant?.sellerId?.toString();
+    const storeId = req.tenant?.storeId ? req.tenant.storeId.toString() : null;
     const { page = 1, limit = 20, status } = req.query;
 
     const pageNum = Math.max(Number(page) || 1, 1);
@@ -1284,6 +1458,11 @@ export const getAmazonListingSubmissions = async (req, res) => {
     const skip = (pageNum - 1) * limitNum;
 
     const query = { sellerId: sellerId.toString() };
+    if (storeId) {
+      query.storeId = storeId;
+    } else {
+      query.$or = [{ storeId: null }, { storeId: { $exists: false } }, { storeId: '' }];
+    }
     if (status && status !== 'All') {
       query.status = status.toUpperCase();
     }
@@ -1293,7 +1472,7 @@ export const getAmazonListingSubmissions = async (req, res) => {
     try {
       [submissions, total] = await Promise.all([
         MarketplaceListingSubmission.find(query)
-          .sort({ updatedAt: -1 })
+          .sort({ updatedAt: -1, _id: -1 })
           .skip(skip)
           .limit(limitNum)
           .populate('productId', 'title masterPrice images stock sku')
@@ -1301,10 +1480,22 @@ export const getAmazonListingSubmissions = async (req, res) => {
         MarketplaceListingSubmission.countDocuments(query),
       ]);
     } catch (e) {
-      // Memory fallback
-      submissions = Array.from(inMemorySubmissionsMap.values()).filter(
-        (s) => s.sellerId?.toString() === sellerId?.toString()
-      );
+      if (isProductionEnv()) {
+        return errorResponse(
+          res,
+          503,
+          'Service Unavailable: Submissions database is currently inaccessible. In-memory fallbacks are permanently disabled in production.',
+          'DATABASE_UNAVAILABLE'
+        );
+      }
+      // Memory fallback with strict seller AND symmetric store matching
+      submissions = Array.from(inMemorySubmissionsMap.values()).filter((s) => {
+        const matchesSeller = s.sellerId?.toString() === sellerId;
+        const sStore = s.storeId ? s.storeId.toString() : null;
+        const matchesStore = sStore === storeId;
+        const matchesStatus = !query.status || s.status === query.status;
+        return matchesSeller && matchesStore && matchesStatus;
+      });
       total = submissions.length;
     }
 
@@ -1329,23 +1520,49 @@ export const getAmazonListingSubmissions = async (req, res) => {
  */
 export const getAmazonListingSubmissionById = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const sellerId = req.tenant?.sellerId?.toString();
+    const storeId = req.tenant?.storeId ? req.tenant.storeId.toString() : null;
     const { id } = req.params;
+
+    const query = {
+      _id: id,
+      sellerId: sellerId.toString(),
+    };
+    if (storeId) {
+      query.storeId = storeId;
+    } else {
+      query.$or = [{ storeId: null }, { storeId: { $exists: false } }, { storeId: '' }];
+    }
 
     let submission = null;
     try {
-      submission = await MarketplaceListingSubmission.findOne({
-        _id: id,
-        sellerId: sellerId.toString(),
-      })
+      submission = await MarketplaceListingSubmission.findOne(query)
         .populate('productId', 'title masterPrice images stock sku description brand')
         .lean();
     } catch (e) {
+      if (isProductionEnv()) {
+        return errorResponse(
+          res,
+          503,
+          'Service Unavailable: Submissions database is currently inaccessible. In-memory fallbacks are permanently disabled in production.',
+          'DATABASE_UNAVAILABLE'
+        );
+      }
       submission = inMemorySubmissionsMap.get(id);
     }
 
-    if (!submission) {
+    if (!submission && !isProductionEnv()) {
       submission = inMemorySubmissionsMap.get(id);
+    }
+
+    // Enforce tenant and symmetric store isolation on in-memory object
+    if (submission) {
+      const matchesSeller = submission.sellerId?.toString() === sellerId;
+      const subStore = submission.storeId ? submission.storeId.toString() : null;
+      const matchesStore = subStore === storeId;
+      if (!matchesSeller || !matchesStore) {
+        submission = null;
+      }
     }
 
     if (!submission) {
@@ -1358,6 +1575,191 @@ export const getAmazonListingSubmissionById = async (req, res) => {
   } catch (error) {
     console.error('Get Listing Submission By Id Error:', error);
     return errorResponse(res, 500, error.message || 'Failed to retrieve listing submission');
+  }
+};
+
+/**
+ * Batch retrieve latest marketplace listing status for multiple products
+ * @route GET /api/channels/marketplace-status
+ */
+export const getMarketplaceListingStatusSummary = async (req, res) => {
+  try {
+    const sellerId = req.tenant?.sellerId?.toString();
+    const storeId = req.tenant?.storeId ? req.tenant.storeId.toString() : null;
+
+    if (!sellerId) {
+      return errorResponse(res, 401, 'Unauthorized tenant context');
+    }
+
+    const { productIds } = req.query;
+    if (!productIds) {
+      return errorResponse(res, 400, 'productIds parameter is required', 'MISSING_PRODUCT_IDS');
+    }
+
+    // Parse productIds from comma-separated string or array
+    let idList = [];
+    if (Array.isArray(productIds)) {
+      idList = productIds.map((id) => String(id).trim()).filter(Boolean);
+    } else if (typeof productIds === 'string') {
+      idList = productIds.split(',').map((id) => id.trim()).filter(Boolean);
+    }
+
+    if (idList.length === 0) {
+      return errorResponse(res, 400, 'At least one productId is required', 'MISSING_PRODUCT_IDS');
+    }
+
+    if (idList.length > 100) {
+      return errorResponse(res, 400, 'Maximum of 100 product IDs allowed per request', 'EXCEEDED_MAX_PRODUCT_IDS');
+    }
+
+    // Validate that every ID is a valid MongoDB ObjectId
+    for (const id of idList) {
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return errorResponse(res, 400, `Invalid product ID format: ${id}`, 'INVALID_PRODUCT_ID');
+      }
+    }
+
+    const uniqueIds = Array.from(new Set(idList));
+
+    // Symmetric store matching filter
+    const storeFilter = storeId
+      ? { storeId }
+      : { $or: [{ storeId: null }, { storeId: { $exists: false } }, { storeId: '' }] };
+
+    // Query authoritative products for the authenticated seller & store
+    let products = [];
+    try {
+      products = await Product.find(
+        {
+          _id: { $in: uniqueIds },
+          sellerId,
+          ...storeFilter,
+        },
+        '_id status aiGenerated aiApproved aiJobId sku title brand'
+      ).lean();
+    } catch (prodErr) {
+      if (isProductionEnv()) {
+        return errorResponse(
+          res,
+          503,
+          'Service Unavailable: Products database is currently inaccessible. In-memory fallbacks are permanently disabled in production.',
+          'DATABASE_UNAVAILABLE'
+        );
+      }
+      // Memory fallback for products
+      products = Array.from(inMemoryProductsMap.values()).filter((p) => {
+        const pId = p._id ? String(p._id) : (p.id ? String(p.id) : '');
+        const matchesId = uniqueIds.includes(pId);
+        const matchesSeller = String(p.sellerId || p.seller) === sellerId;
+        const pStore = p.storeId ? String(p.storeId) : null;
+        const matchesStore = pStore === storeId;
+        return matchesId && matchesSeller && matchesStore;
+      });
+    }
+
+    const authorizedProductIds = products.map((p) => String(p._id || p.id));
+    const productsById = new Map();
+    products.forEach((p) => {
+      const pid = String(p._id || p.id);
+      productsById.set(pid, p);
+    });
+
+    // Query submissions deterministically sorted by updatedAt descending, _id descending
+    let submissions = [];
+    try {
+      submissions = await MarketplaceListingSubmission.find({
+        sellerId,
+        productId: { $in: authorizedProductIds },
+        ...storeFilter,
+      })
+        .sort({ updatedAt: -1, _id: -1 })
+        .lean();
+    } catch (subErr) {
+      if (isProductionEnv()) {
+        return errorResponse(
+          res,
+          503,
+          'Service Unavailable: Submissions database is currently inaccessible. In-memory fallbacks are permanently disabled in production.',
+          'DATABASE_UNAVAILABLE'
+        );
+      }
+      // In-memory fallback sorted deterministically
+      submissions = Array.from(inMemorySubmissionsMap.values())
+        .filter((s) => {
+          const matchesSeller = s.sellerId?.toString() === sellerId;
+          const sStore = s.storeId ? String(s.storeId) : null;
+          const matchesStore = sStore === storeId;
+          const matchesProd = authorizedProductIds.includes(String(s.productId));
+          return matchesSeller && matchesStore && matchesProd;
+        })
+        .sort((a, b) => {
+          const timeA = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          const timeB = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          if (timeB !== timeA) return timeB - timeA;
+          return String(b._id || b.id || '').localeCompare(String(a._id || a.id || ''));
+        });
+    }
+
+    // Group submissions deterministically by productId + provider (Correction 1)
+    const latestSubmissionsByProductAndProvider = new Map();
+    for (const sub of submissions) {
+      const prodId = String(sub.productId);
+      const provider = sub.provider ? String(sub.provider).toUpperCase() : 'UNKNOWN';
+      const key = `${prodId}_${provider}`;
+      if (!latestSubmissionsByProductAndProvider.has(key)) {
+        latestSubmissionsByProductAndProvider.set(key, {
+          productId: prodId,
+          provider: sub.provider || provider,
+          status: sub.status,
+          submissionId: sub._id ? String(sub._id) : (sub.id ? String(sub.id) : null),
+          submittedAt: sub.responseMetadata?.submittedAt || sub.lastSubmittedAt || sub.updatedAt,
+          amazonSubmissionId: sub.amazonSubmissionId || null,
+          productType: sub.productType,
+          issues: sub.issues || [],
+        });
+      }
+    }
+
+    // Build the final status response for each authorized product
+    const statuses = {};
+    for (const [prodId, prod] of productsById.entries()) {
+      const isEligible = isProductEligibleForPublishing(prod);
+      let eligibilityReason = 'Eligible for publishing';
+      if (!isEligible) {
+        if (prod.status === 'Draft' || prod.status === 'Archived') {
+          eligibilityReason = `Product status is ${prod.status}. Only active products are eligible for publishing.`;
+        } else if (prod.aiGenerated || prod.aiJobId) {
+          eligibilityReason = 'AI-generated product requires seller review and approval before publishing.';
+        } else {
+          eligibilityReason = 'Product is not in an active catalog state.';
+        }
+      }
+
+      // Collect all provider submissions for this product
+      const submissionsByProvider = {};
+      for (const [key, subRecord] of latestSubmissionsByProductAndProvider.entries()) {
+        if (key.startsWith(`${prodId}_`)) {
+          const prov = key.substring(prodId.length + 1);
+          submissionsByProvider[prov] = subRecord;
+        }
+      }
+
+      statuses[prodId] = {
+        eligibility: {
+          isEligible,
+          reason: eligibilityReason,
+        },
+        submissions: submissionsByProvider,
+        amazon: submissionsByProvider['AMAZON'] || null,
+      };
+    }
+
+    return successResponse(res, 200, 'Marketplace status summary retrieved successfully', {
+      statuses,
+    });
+  } catch (error) {
+    console.error('Get Marketplace Listing Status Summary Error:', error);
+    return errorResponse(res, 500, error.message || 'Failed to retrieve marketplace status summary');
   }
 };
 

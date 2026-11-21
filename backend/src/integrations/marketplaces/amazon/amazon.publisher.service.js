@@ -1,13 +1,227 @@
-import { MarketplaceListingSubmission } from '../../../modules/channels/marketplaceListingSubmission.model.js';
+import {
+  MarketplaceListingSubmission,
+  inMemorySubmissionsMap,
+} from '../../../modules/channels/marketplaceListingSubmission.model.js';
 import { Product } from '../../../modules/products/product.model.js';
 import { ChannelConnection } from '../../../modules/channels/channelConnection.model.js';
 import { inMemoryChannelsMap, buildTenantConnectionQuery } from '../../../modules/channels/channel.service.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
 import { AmazonSpApiClient } from './amazon.client.js';
 import { config } from '../../../config/env.js';
+import { isProductionEnv } from '../../../config/storage.js';
+import { inMemoryProductsMap } from '../../../modules/products/product.service.js';
+import { isProductEligibleForPublishing } from '../../../modules/channels/channel.controller.js';
 
-// In-memory fallback map for test environments
-export const inMemorySubmissionsMap = new Map();
+// Re-export in-memory fallback map for test environments
+export { inMemorySubmissionsMap };
+
+/**
+ * Check if a host or URL refers to localhost or private network.
+ */
+export function isLocalOrPrivateHost(hostOrUrl) {
+  if (!hostOrUrl || typeof hostOrUrl !== 'string') return false;
+  const h = hostOrUrl.trim().toLowerCase();
+  return (
+    h.includes('localhost') ||
+    h.includes('127.0.0.1') ||
+    h.includes('0.0.0.0') ||
+    h.includes('::1') ||
+    h.endsWith('.local') ||
+    h.endsWith('.internal')
+  );
+}
+
+/**
+ * Resolves and validates an image locator for Amazon SP-API submissions.
+ * Amazon strictly requires publicly accessible HTTPS URLs.
+ *
+ * @param {string|Object} rawImage - Image URL string or image object
+ * @param {Object} [options]
+ * @param {string} [options.assetBaseUrl] - Optional base URL for resolving local uploads
+ * @returns {{ valid: boolean, url: string|null, issueCode: string|null, message: string|null }}
+ */
+export const resolveAmazonProductImageUrl = (rawImage, options = {}) => {
+  let imgStr = '';
+  if (typeof rawImage === 'string') {
+    imgStr = rawImage.trim();
+  } else if (rawImage && typeof rawImage === 'object') {
+    imgStr = (rawImage.secure_url || rawImage.url || '').trim();
+  }
+
+  // 1. Missing or empty
+  if (!imgStr) {
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'MISSING_MAIN_IMAGE',
+      message: 'Product image is required for Amazon listing submissions.',
+    };
+  }
+
+  const lower = imgStr.toLowerCase();
+
+  // 2. Reject blob: URLs
+  if (lower.startsWith('blob:')) {
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'INVALID_IMAGE_URL',
+      message: 'Amazon rejects blob: URLs. Images must be permanently hosted public HTTPS URLs.',
+    };
+  }
+
+  // 3. Reject data: inline URIs
+  if (lower.startsWith('data:')) {
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'INVALID_IMAGE_URL',
+      message: 'Amazon rejects data: inline URIs. Images must be hosted public HTTPS URLs.',
+    };
+  }
+
+  // 4. Reject local filesystem paths (file://, C:\, /Users/, /var/, relative dot paths, etc.)
+  if (
+    lower.startsWith('file:') ||
+    /^[a-zA-Z]:[\\/]/.test(imgStr) ||
+    imgStr.startsWith('./') ||
+    imgStr.startsWith('../') ||
+    (imgStr.startsWith('/') && !imgStr.startsWith('/uploads/'))
+  ) {
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'INVALID_IMAGE_URL',
+      message: 'Amazon rejects local filesystem paths. Images must be public HTTPS URLs.',
+    };
+  }
+
+  // 5. Reject insecure HTTP
+  if (lower.startsWith('http://')) {
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'INSECURE_IMAGE_URL',
+      message: 'Amazon requires secure HTTPS image URLs. Insecure HTTP is rejected.',
+    };
+  }
+
+  // 6. Handle local uploaded assets (/uploads/... or uploads/...)
+  if (imgStr.startsWith('/uploads/') || imgStr.startsWith('uploads/')) {
+    const cleanPath = imgStr.startsWith('/') ? imgStr : `/${imgStr}`;
+    const base = (
+      options.assetBaseUrl ||
+      process.env.PUBLIC_ASSET_BASE_URL ||
+      process.env.PUBLIC_ASSET_URL ||
+      process.env.ASSET_BASE_URL ||
+      process.env.PUBLIC_URL ||
+      process.env.APP_URL ||
+      ''
+    ).trim().replace(/\/+$/, '');
+
+    // The base URL must be a valid public HTTPS URL and not localhost
+    if (base && base.toLowerCase().startsWith('https://') && !isLocalOrPrivateHost(base)) {
+      return {
+        valid: true,
+        url: `${base}${cleanPath}`,
+        issueCode: null,
+        message: null,
+      };
+    }
+
+    return {
+      valid: false,
+      url: null,
+      issueCode: 'UNRESOLVED_IMAGE_URL',
+      message: `Local upload asset "${imgStr}" cannot be resolved to a public HTTPS URL because no public HTTPS asset base URL is configured.`,
+    };
+  }
+
+  // 7. Verify HTTPS URL
+  if (lower.startsWith('https://')) {
+    try {
+      const parsed = new URL(imgStr);
+      if (isLocalOrPrivateHost(parsed.hostname)) {
+        return {
+          valid: false,
+          url: null,
+          issueCode: 'INVALID_IMAGE_URL',
+          message: 'Amazon rejects private host and localhost HTTPS URLs. The URL must be publicly accessible.',
+        };
+      }
+      return {
+        valid: true,
+        url: imgStr,
+        issueCode: null,
+        message: null,
+      };
+    } catch {
+      return {
+        valid: false,
+        url: null,
+        issueCode: 'INVALID_IMAGE_URL',
+        message: 'Invalid image URL syntax.',
+      };
+    }
+  }
+
+  // Any other scheme or unresolved string
+  return {
+    valid: false,
+    url: null,
+    issueCode: 'INVALID_IMAGE_URL',
+    message: 'Amazon requires publicly accessible HTTPS image URLs.',
+  };
+};
+
+/**
+ * Extract snapshot of all 13 protected master product fields for immutability verification:
+ * title, description, shortDescription, bulletPoints, productType, brand,
+ * categoryName, subcategory, attributes, images, masterPrice, costPrice, stock.
+ */
+export const snapshotMasterProductFields = (prod) => {
+  if (!prod) return null;
+  const p = typeof prod.toObject === 'function' ? prod.toObject() : prod;
+  return {
+    title: p.title,
+    description: p.description,
+    shortDescription: p.shortDescription,
+    bulletPoints: Array.isArray(p.bulletPoints) ? JSON.parse(JSON.stringify(p.bulletPoints)) : p.bulletPoints,
+    productType: p.productType,
+    brand: p.brand,
+    categoryName: p.categoryName,
+    subcategory: p.subcategory,
+    attributes: p.attributes instanceof Map
+      ? Object.fromEntries(p.attributes)
+      : (p.attributes ? JSON.parse(JSON.stringify(p.attributes)) : p.attributes),
+    images: Array.isArray(p.images) ? JSON.parse(JSON.stringify(p.images)) : p.images,
+    masterPrice: p.masterPrice,
+    costPrice: p.costPrice,
+    stock: p.stock,
+  };
+};
+
+/**
+ * Verify that all 13 protected master product fields are strictly identical to initial snapshot.
+ */
+export const assertMasterProductImmutability = (prod, initialSnapshot) => {
+  if (!prod || !initialSnapshot) return;
+  const current = snapshotMasterProductFields(prod);
+  const fields = [
+    'title', 'description', 'shortDescription', 'bulletPoints',
+    'productType', 'brand', 'categoryName', 'subcategory',
+    'attributes', 'images', 'masterPrice', 'costPrice', 'stock'
+  ];
+  for (const field of fields) {
+    const beforeStr = JSON.stringify(initialSnapshot[field] ?? null);
+    const afterStr = JSON.stringify(current[field] ?? null);
+    if (beforeStr !== afterStr) {
+      throw new Error(
+        `FATAL SAFETY VIOLATION: Master product field "${field}" was altered during Amazon listing operations. Before: ${beforeStr}, After: ${afterStr}`
+      );
+    }
+  }
+};
 
 /**
  * Validate listing attributes according to Amazon SP-API guidelines
@@ -22,24 +236,36 @@ export const inMemorySubmissionsMap = new Map();
 export const validateListingData = (arg1 = {}, arg2 = {}) => {
   let product = {};
   let mappedAttributes = {};
-  let productType = 'SHIRT';
+  let rawProductType = '';
   let gtinExemption = false;
 
   if (arg1.product || arg1.mappedAttributes) {
     product = arg1.product || {};
     mappedAttributes = arg1.mappedAttributes || {};
-    productType = arg1.productType || 'SHIRT';
-    gtinExemption = Boolean(arg1.gtinExemption ?? arg1.gtinExemptionRequested);
+    rawProductType = arg1.productType || mappedAttributes.productType || product.productType || '';
+    gtinExemption = Boolean(arg1.gtinExemption ?? arg1.gtinExemptionRequested ?? mappedAttributes.gtinExemptionRequested);
   } else {
     mappedAttributes = arg1;
     product = arg2.product || {};
-    productType = arg2.productType || 'SHIRT';
+    rawProductType = arg2.productType || mappedAttributes.productType || product.productType || '';
     gtinExemption = Boolean(arg1.gtinExemptionRequested ?? arg1.gtinExemption ?? arg2.gtinExemption);
   }
 
+  const cleanProductType = typeof rawProductType === 'string' ? rawProductType.trim().toUpperCase() : '';
   const issues = [];
 
-  const title = (mappedAttributes.title || mappedAttributes.item_name || product.name || product.title || '').trim();
+  // 0. Product Type Validation (Never default to SHIRT or another arbitrary category)
+  if (!cleanProductType) {
+    issues.push({
+      code: 'MISSING_PRODUCT_TYPE',
+      severity: 'ERROR',
+      message: 'Amazon Product Type is required. Please select a valid product type definition.',
+      attribute: 'productType',
+      attributeName: 'productType',
+    });
+  }
+
+  const title = (mappedAttributes.title || mappedAttributes.item_name || product.title || product.name || '').trim();
   const brand = (mappedAttributes.brand || product.brand || '').trim();
   const sellerSku = (mappedAttributes.sellerSku || mappedAttributes.sku || product.sku || '').trim();
   const description = (mappedAttributes.description || product.description || '').trim();
@@ -52,7 +278,7 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
   } else if (mappedAttributes.mainImage || mappedAttributes.main_image) {
     images = [mappedAttributes.mainImage || mappedAttributes.main_image, ...(mappedAttributes.otherImages || [])];
   } else if (Array.isArray(product.images) && product.images.length > 0) {
-    images = product.images.map((img) => (img.url ? img.url : img));
+    images = product.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean);
   }
 
   // 1. Title Validation
@@ -79,9 +305,11 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
     issues.push({ code: 'MISSING_DESCRIPTION', severity: 'ERROR', message: 'Product description is required.', attribute: 'description', attributeName: 'description' });
   }
 
-  // 5. Bullet Points Validation
-  const bullets = Array.isArray(mappedAttributes.bulletPoints || mappedAttributes.bullet_point)
+  // 5. Bullet Points Validation (Use verified master product bullet points when available)
+  const bullets = Array.isArray(mappedAttributes.bulletPoints || mappedAttributes.bullet_point) && (mappedAttributes.bulletPoints || mappedAttributes.bullet_point).length > 0
     ? (mappedAttributes.bulletPoints || mappedAttributes.bullet_point).filter(Boolean)
+    : Array.isArray(product.bulletPoints) && product.bulletPoints.length > 0
+    ? product.bulletPoints.filter(Boolean)
     : product.tags && product.tags.length > 0
     ? product.tags
     : [];
@@ -101,13 +329,42 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
 
   // 7. Image Validation
   if (!images || images.length === 0 || !images[0]) {
-    issues.push({ code: 'MISSING_MAIN_IMAGE', severity: 'ERROR', message: 'At least one product image is required for Amazon listing.', attribute: 'mainImage', attributeName: 'main_image' });
+    issues.push({
+      code: 'MISSING_MAIN_IMAGE',
+      severity: 'ERROR',
+      message: 'At least one product image is required for Amazon listing.',
+      attribute: 'mainImage',
+      attributeName: 'main_image',
+    });
   } else {
-    const mainImg = String(images[0]).trim();
-    if (!mainImg.startsWith('http://') && !mainImg.startsWith('https://') && !mainImg.startsWith('/uploads/')) {
-      issues.push({ code: 'INVALID_IMAGE_URL', severity: 'ERROR', message: 'Main product image must be a valid public HTTPS URL or local upload asset.', attribute: 'mainImage', attributeName: 'main_image' });
-    } else if (mainImg.startsWith('http://')) {
-      issues.push({ code: 'INSECURE_IMAGE_URL', severity: 'ERROR', message: 'Amazon requires secure HTTPS image URLs.', attribute: 'mainImage', attributeName: 'main_image' });
+    const mainImgResolution = resolveAmazonProductImageUrl(images[0], {
+      assetBaseUrl: arg1.assetBaseUrl || arg2.assetBaseUrl,
+    });
+    if (!mainImgResolution.valid) {
+      issues.push({
+        code: mainImgResolution.issueCode || 'INVALID_IMAGE_URL',
+        severity: 'ERROR',
+        message: mainImgResolution.message || 'Main product image must be a valid public HTTPS URL.',
+        attribute: 'mainImage',
+        attributeName: 'main_image',
+      });
+    }
+
+    if (images.length > 1) {
+      for (let i = 1; i < images.length; i++) {
+        const otherRes = resolveAmazonProductImageUrl(images[i], {
+          assetBaseUrl: arg1.assetBaseUrl || arg2.assetBaseUrl,
+        });
+        if (!otherRes.valid) {
+          issues.push({
+            code: otherRes.issueCode || 'INVALID_IMAGE_URL',
+            severity: 'ERROR',
+            message: otherRes.message || `Secondary image at index ${i} must be a valid public HTTPS URL.`,
+            attribute: 'otherImages',
+            attributeName: `other_product_image_locator_${i}`,
+          });
+        }
+      }
     }
   }
 
@@ -146,7 +403,7 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
  * @param {Object} params
  * @param {Object} params.product Master Product
  * @param {Object} params.mappedAttributes Mapped dynamic attributes
- * @param {string} [params.productType='SHIRT']
+ * @param {string} params.productType Amazon product type (e.g. 'SHIRT')
  * @param {string} [params.marketplaceId='A21TJRUUN4KGV']
  * @param {string} params.sellerSku
  * @param {boolean} [params.gtinExemption=false]
@@ -155,7 +412,7 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
 export const buildSpApiListingPayload = (arg1 = {}, arg2 = {}) => {
   let product = {};
   let mappedAttributes = {};
-  let productType = 'SHIRT';
+  let productType = '';
   let marketplaceId = 'A21TJRUUN4KGV';
   let sellerSku = '';
   let gtinExemption = false;
@@ -163,22 +420,23 @@ export const buildSpApiListingPayload = (arg1 = {}, arg2 = {}) => {
   if (arg1.product || arg1.mappedAttributes) {
     product = arg1.product || {};
     mappedAttributes = arg1.mappedAttributes || {};
-    productType = arg1.productType || 'SHIRT';
-    marketplaceId = arg1.marketplaceId || 'A21TJRUUN4KGV';
-    sellerSku = arg1.sellerSku || '';
-    gtinExemption = Boolean(arg1.gtinExemption ?? arg1.gtinExemptionRequested);
+    productType = arg1.productType || mappedAttributes.productType || product.productType || '';
+    marketplaceId = arg1.marketplaceId || mappedAttributes.marketplaceId || 'A21TJRUUN4KGV';
+    sellerSku = arg1.sellerSku || mappedAttributes.sellerSku || '';
+    gtinExemption = Boolean(arg1.gtinExemption ?? arg1.gtinExemptionRequested ?? mappedAttributes.gtinExemptionRequested);
   } else {
     mappedAttributes = arg1;
     product = arg2.product || {};
-    productType = arg2.productType || 'SHIRT';
-    marketplaceId = arg2.marketplaceId || 'A21TJRUUN4KGV';
-    sellerSku = arg2.sellerSku || arg1.sellerSku || '';
+    productType = arg2.productType || mappedAttributes.productType || product.productType || '';
+    marketplaceId = arg2.marketplaceId || mappedAttributes.marketplaceId || 'A21TJRUUN4KGV';
+    sellerSku = arg2.sellerSku || arg1.sellerSku || mappedAttributes.sellerSku || '';
     gtinExemption = Boolean(arg1.gtinExemptionRequested ?? arg1.gtinExemption ?? arg2.gtinExemption);
   }
 
   const cleanSku = (sellerSku || mappedAttributes.sellerSku || product.sku || '').trim().toUpperCase();
-  const cleanType = (productType || 'SHIRT').trim().toUpperCase();
-  const title = (mappedAttributes.title || mappedAttributes.item_name || product.name || product.title || '').trim();
+  const cleanType = (productType || '').trim().toUpperCase();
+
+  const title = (mappedAttributes.title || mappedAttributes.item_name || product.title || product.name || 'Generic Product').trim();
   const brand = (mappedAttributes.brand || product.brand || 'Generic').trim();
   const description = (mappedAttributes.description || product.description || '').trim();
   const price = Number(mappedAttributes.price ?? mappedAttributes.standard_price ?? product.masterPrice ?? product.price ?? 0);
@@ -190,14 +448,30 @@ export const buildSpApiListingPayload = (arg1 = {}, arg2 = {}) => {
   } else if (mappedAttributes.mainImage || mappedAttributes.main_image) {
     images = [mappedAttributes.mainImage || mappedAttributes.main_image, ...(mappedAttributes.otherImages || [])];
   } else if (Array.isArray(product.images) && product.images.length > 0) {
-    images = product.images.map((img) => (img.url ? img.url : img));
+    images = product.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean);
   }
 
-  const rawBullets = Array.isArray(mappedAttributes.bulletPoints || mappedAttributes.bullet_point)
+  const rawBullets = Array.isArray(mappedAttributes.bulletPoints || mappedAttributes.bullet_point) && (mappedAttributes.bulletPoints || mappedAttributes.bullet_point).length > 0
     ? (mappedAttributes.bulletPoints || mappedAttributes.bullet_point).filter(Boolean)
+    : Array.isArray(product.bulletPoints) && product.bulletPoints.length > 0
+    ? product.bulletPoints.filter(Boolean)
     : product.tags && product.tags.length > 0
     ? product.tags
     : [description.slice(0, 100)];
+
+  // Helper to extract known attributes from mappedAttributes or product.attributes
+  const getAttr = (key) => {
+    if (mappedAttributes.categoryAttributes?.[key]) return mappedAttributes.categoryAttributes[key];
+    if (mappedAttributes[key]) return mappedAttributes[key];
+    if (product[key]) return product[key];
+    if (product.attributes instanceof Map && product.attributes.has(key)) {
+      return product.attributes.get(key);
+    }
+    if (product.attributes && typeof product.attributes === 'object' && product.attributes[key]) {
+      return product.attributes[key];
+    }
+    return '';
+  };
 
   const attributes = {
     item_name: [{ value: title, marketplace_id: marketplaceId }],
@@ -230,50 +504,65 @@ export const buildSpApiListingPayload = (arg1 = {}, arg2 = {}) => {
     ],
   };
 
-  // Add images
+  // Add images with canonical public HTTPS resolution
   if (images.length > 0) {
+    const mainImgResolution = resolveAmazonProductImageUrl(images[0], {
+      assetBaseUrl: arg1.assetBaseUrl || arg2.assetBaseUrl,
+    });
     attributes.main_product_image_locator = [
       {
-        media_location: String(images[0]).trim(),
+        media_location: (mainImgResolution.valid && mainImgResolution.url) ? mainImgResolution.url : String(images[0]).trim(),
         marketplace_id: marketplaceId,
       },
     ];
 
     if (images.length > 1) {
+      const otherImgResolution = resolveAmazonProductImageUrl(images[1], {
+        assetBaseUrl: arg1.assetBaseUrl || arg2.assetBaseUrl,
+      });
       attributes.other_product_image_locator_1 = [
-        { media_location: String(images[1]).trim(), marketplace_id: marketplaceId },
+        {
+          media_location: (otherImgResolution.valid && otherImgResolution.url) ? otherImgResolution.url : String(images[1]).trim(),
+          marketplace_id: marketplaceId,
+        },
       ];
     }
   }
 
   // Country of origin (Mandatory in Amazon India)
+  const countryVal = getAttr('countryOfOrigin') || getAttr('country_of_origin') || getAttr('origin') || 'IN';
   attributes.country_of_origin = [
-    { value: mappedAttributes.countryOfOrigin || mappedAttributes.country_of_origin || 'IN', marketplace_id: marketplaceId },
+    { value: countryVal, marketplace_id: marketplaceId },
   ];
 
   // Manufacturer
-  if (mappedAttributes.manufacturer || product.brand) {
+  const mfrVal = getAttr('manufacturer') || product.brand;
+  if (mfrVal) {
     attributes.manufacturer = [
-      { value: mappedAttributes.manufacturer || product.brand, marketplace_id: marketplaceId },
+      { value: mfrVal, marketplace_id: marketplaceId },
     ];
   }
 
-  // Category specific optional fields
-  if (mappedAttributes.categoryAttributes?.color || mappedAttributes.color || product.color) {
-    attributes.color = [{ value: mappedAttributes.categoryAttributes?.color || mappedAttributes.color || product.color, marketplace_id: marketplaceId }];
+  // Category specific schema-defined fields (mapped from known attributes, not generic dump)
+  const colorVal = getAttr('color');
+  if (colorVal) {
+    attributes.color = [{ value: colorVal, marketplace_id: marketplaceId }];
   }
-  if (mappedAttributes.categoryAttributes?.material || mappedAttributes.material || product.material) {
-    attributes.material = [{ value: mappedAttributes.categoryAttributes?.material || mappedAttributes.material || product.material, marketplace_id: marketplaceId }];
+  const materialVal = getAttr('material');
+  if (materialVal) {
+    attributes.material = [{ value: materialVal, marketplace_id: marketplaceId }];
   }
-  if (mappedAttributes.categoryAttributes?.size || mappedAttributes.size) {
-    attributes.size = [{ value: mappedAttributes.categoryAttributes?.size || mappedAttributes.size, marketplace_id: marketplaceId }];
+  const sizeVal = getAttr('size');
+  if (sizeVal) {
+    attributes.size = [{ value: sizeVal, marketplace_id: marketplaceId }];
   }
-  if (mappedAttributes.categoryAttributes?.department || mappedAttributes.department) {
-    attributes.department = [{ value: mappedAttributes.categoryAttributes?.department || mappedAttributes.department, marketplace_id: marketplaceId }];
+  const deptVal = getAttr('department') || getAttr('targetGender');
+  if (deptVal) {
+    attributes.department = [{ value: deptVal, marketplace_id: marketplaceId }];
   }
 
   // GTIN / Product ID handling
-  const gtinVal = mappedAttributes.externalProductId || mappedAttributes.standard_product_id;
+  const gtinVal = mappedAttributes.externalProductId || mappedAttributes.standard_product_id || product.barcode;
   if (!gtinExemption && gtinVal) {
     attributes.standard_product_id = [
       {
@@ -304,12 +593,12 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
   let mode = null;
 
   if (arg1.tenant || arg1.submissionId !== undefined) {
-    tenant = arg1.tenant || {};
+    tenant = arg1.tenant || arg2.tenant || {};
     submissionId = arg1.submissionId;
-    mode = arg1.mode || arg1.submissionMode;
-    dryRun = arg1.dryRun !== undefined ? arg1.dryRun : (mode === 'SANDBOX_SUBMISSION' || mode === 'VALIDATION_PREVIEW' ? false : true);
-    client = arg1.client || null;
-    environment = arg1.environment || null;
+    mode = arg1.mode || arg1.submissionMode || arg2.mode || arg2.submissionMode;
+    dryRun = arg1.dryRun !== undefined ? arg1.dryRun : (arg2.dryRun !== undefined ? arg2.dryRun : (mode === 'SANDBOX_SUBMISSION' || mode === 'VALIDATION_PREVIEW' ? false : true));
+    client = arg1.client || arg2.client || null;
+    environment = arg1.environment || arg2.environment || null;
   } else {
     // Called as executeListingSubmission(submissionDoc, options)
     submissionId = arg1;
@@ -355,16 +644,100 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
     throw err;
   }
 
-  // 3. Fetch Master Product (Strictly Read-Only)
-  let masterProduct = null;
-  try {
-    masterProduct = await Product.findOne({ _id: submission.productId, sellerId });
-  } catch (e) {
-    // fallback
+  // Ensure mock / in-memory submissions have a callable save()
+  if (typeof submission.save !== 'function') {
+    submission.save = async function () { return this; };
   }
 
-  if (!masterProduct) {
-    // If testing with in-memory product
+  // 3. Authoritative Master Product Retrieval (Strictly Read-Only from MongoDB)
+  let masterProduct = null;
+  const storeId = tenant?.storeId || submission?.storeId;
+
+  const productQuery = {
+    _id: submission.productId,
+    sellerId: sellerId?.toString(),
+  };
+  if (storeId) {
+    productQuery.storeId = storeId.toString();
+  }
+
+  try {
+    masterProduct = await Product.findOne(productQuery);
+  } catch (e) {
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Master product could not be verified in MongoDB. Please try again later.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+  }
+
+  // Production Safety: In production, in-memory product fallback is STRICTLY PROHIBITED
+  if (isProductionEnv() && !masterProduct) {
+    const notFoundErr = new Error(`Authoritative Product "${submission.productId}" not found in MongoDB for this seller/store.`);
+    notFoundErr.code = 'PRODUCT_NOT_FOUND';
+    notFoundErr.status = 404;
+    throw notFoundErr;
+  }
+
+  // Non-production test fallback: check in-memory map
+  if (!masterProduct && !isProductionEnv()) {
+    if (inMemoryProductsMap.has(String(submission.productId))) {
+      masterProduct = inMemoryProductsMap.get(String(submission.productId));
+    }
+  }
+
+  // Enforce Tenant & Store Isolation and Product Ownership
+  if (masterProduct) {
+    const prodSeller = masterProduct.sellerId ? String(masterProduct.sellerId) : null;
+    const reqSeller = sellerId ? String(sellerId) : null;
+    if (prodSeller && reqSeller && prodSeller !== reqSeller) {
+      const authErr = new Error('Cross-tenant product access forbidden.');
+      authErr.code = 'UNAUTHORIZED_ACCESS';
+      authErr.status = 403;
+      throw authErr;
+    }
+
+    // Symmetric Store Context Matching
+    const prodStore = masterProduct.storeId ? String(masterProduct.storeId) : null;
+    const reqStore = storeId ? String(storeId) : null;
+
+    if (prodStore && !reqStore) {
+      const storeErr = new Error('Store context required: Product belongs to a specific store context.');
+      storeErr.code = 'UNAUTHORIZED_ACCESS';
+      storeErr.status = 403;
+      throw storeErr;
+    }
+    if (!prodStore && reqStore) {
+      const storeErr = new Error('Store context mismatch: Product has no store association but request specifies a store context.');
+      storeErr.code = 'UNAUTHORIZED_ACCESS';
+      storeErr.status = 403;
+      throw storeErr;
+    }
+    if (prodStore && reqStore && prodStore !== reqStore) {
+      const storeErr = new Error('Cross-store product access forbidden.');
+      storeErr.code = 'UNAUTHORIZED_ACCESS';
+      storeErr.status = 403;
+      throw storeErr;
+    }
+
+    // Established Approval & Status Distinction:
+    // AI-generated products require explicit seller approval (aiApproved === true)
+    // Manual products must have active status (not Draft or Archived)
+    if (!isProductEligibleForPublishing(masterProduct)) {
+      const approvalErr = new Error(
+        masterProduct.status === 'Draft' || masterProduct.status === 'Archived'
+          ? `Product is in '${masterProduct.status}' status and cannot be published to Amazon.`
+          : 'Product is not approved for marketplace publishing. AI-generated products require seller approval.'
+      );
+      approvalErr.code = 'PRODUCT_NOT_APPROVED';
+      approvalErr.status = 400;
+      throw approvalErr;
+    }
+  }
+
+  if (!masterProduct && !isProductionEnv()) {
+    // Controlled test fixture for offline test suites that do not seed inMemoryProductsMap
     masterProduct = {
       _id: submission.productId,
       title: submission.mappedAttributes?.item_name || 'Demo Master Product',
@@ -374,12 +747,22 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       masterPrice: submission.mappedAttributes?.standard_price || 999,
       stock: submission.mappedAttributes?.quantity || 10,
       images: submission.mappedAttributes?.images || ['https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=800'],
+      status: 'Active',
+      aiApproved: true,
     };
   }
 
-  // Record initial master product snapshot to verify non-mutation
-  const masterPriceBefore = masterProduct.masterPrice;
-  const masterStockBefore = masterProduct.stock;
+  if (!masterProduct) {
+    const err = new Error(`Master product "${submission.productId}" could not be resolved.`);
+    err.code = 'PRODUCT_NOT_FOUND';
+    err.status = 404;
+    throw err;
+  }
+
+  // Record initial master product snapshot of all 13 protected fields to verify non-mutation:
+  // title, description, shortDescription, bulletPoints, productType, brand, categoryName,
+  // subcategory, attributes, images, masterPrice, costPrice, stock.
+  const initialMasterSnapshot = snapshotMasterProductFields(masterProduct);
 
   // 4. Validate Attributes
   const gtinExempt = Boolean(
@@ -398,6 +781,7 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
   submission.issues = validation.issues;
 
   if (!validation.valid) {
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
     submission.status = 'VALIDATION_FAILED';
     submission.lastCheckedAt = new Date();
     try {
@@ -446,10 +830,8 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       inMemorySubmissionsMap.set(String(submissionId), submission);
     }
 
-    // Safety verification: master product untouched
-    if (masterProduct.masterPrice !== masterPriceBefore || masterProduct.stock !== masterStockBefore) {
-      throw new Error('FATAL SAFETY VIOLATION: Master product price or stock was altered during listing validation.');
-    }
+    // Safety verification: master product untouched across all 13 fields
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
 
     return {
       success: true,
@@ -546,6 +928,8 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
         inMemorySubmissionsMap.set(String(submissionId), submission);
       }
 
+      assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
       return {
         success: true,
         status: 'SANDBOX_SUBMITTED',
@@ -571,6 +955,8 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       } catch (e) {
         inMemorySubmissionsMap.set(String(submissionId), submission);
       }
+
+      assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
 
       return {
         success: false,
@@ -600,6 +986,8 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
   } catch (e) {
     inMemorySubmissionsMap.set(String(submissionId), submission);
   }
+
+  assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
 
   return {
     success: true,

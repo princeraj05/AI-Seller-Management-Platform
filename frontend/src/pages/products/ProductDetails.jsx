@@ -177,9 +177,13 @@ export default function ProductDetails() {
           <div>
             <h3 className="font-bold text-slate-800 mb-2">Publish Status Across Channels</h3>
             <div className="flex flex-wrap gap-2">
-              <div className="px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-1.5 text-amber-800 font-medium">
+              <Link
+                to={`/channels/amazon?tab=publish&productId=${product._id || product.id}`}
+                className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg flex items-center gap-1.5 text-amber-800 font-medium transition-colors"
+                title="Publish or manage this product on Amazon India"
+              >
                 <Store className="w-3.5 h-3.5 text-amber-600" /> Amazon (Ready)
-              </div>
+              </Link>
               <div className="px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-1.5 text-blue-800 font-medium">
                 <ShoppingBag className="w-3.5 h-3.5 text-blue-600" /> Flipkart (Ready)
               </div>

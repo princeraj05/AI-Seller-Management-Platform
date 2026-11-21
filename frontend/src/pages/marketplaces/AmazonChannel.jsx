@@ -47,6 +47,7 @@ import {
 
 export default function AmazonChannel() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const urlTab = searchParams.get('tab');
   const [connection, setConnection] = useState(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
@@ -58,8 +59,17 @@ export default function AmazonChannel() {
   const [showConnectModal, setShowConnectModal] = useState(false);
   const [connectTab, setConnectTab] = useState('oauth'); // 'oauth' | 'manual'
 
-  // Main UI Tab: 'listings' | 'inventory' | 'pricing' | 'catalog' | 'settings'
-  const [activeTab, setActiveTab] = useState('listings');
+  // Main UI Tab: 'listings' | 'inventory' | 'pricing' | 'catalog' | 'settings' | 'publish'
+  const validTabs = ['listings', 'inventory', 'pricing', 'catalog', 'settings', 'publish'];
+  const [activeTab, setActiveTab] = useState(validTabs.includes(urlTab) ? urlTab : 'listings');
+
+  // Synchronize activeTab when URL searchParams change (handles direct links and browser back/forward)
+  useEffect(() => {
+    const tabFromUrl = searchParams.get('tab');
+    if (tabFromUrl && validTabs.includes(tabFromUrl)) {
+      setActiveTab(tabFromUrl);
+    }
+  }, [searchParams]);
 
   // Listings State
   const [listings, setListings] = useState([]);
@@ -1292,6 +1302,7 @@ export default function AmazonChannel() {
       {activeTab === 'publish' && (
         <AmazonListingPublisher
           connection={connection}
+          initialProductId={searchParams.get('productId')}
           onListingCreated={() => fetchListings(1, '')}
         />
       )}
