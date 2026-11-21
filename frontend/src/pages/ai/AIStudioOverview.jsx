@@ -29,7 +29,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { generateProductAIApi, analyzeProductImageApi, generateListingDraftApi } from '../../services/aiService';
-import { createProductApi } from '../../services/productService';
+import { createProductApi, uploadProductImageApi } from '../../services/productService';
 import { getAiInsightsApi, askAiAssistantApi } from '../../services/aiIntelligenceService';
 
 export default function AIStudioOverview() {
@@ -123,7 +123,10 @@ export default function AIStudioOverview() {
   // Step 3: Master Product Persistence States
   const [listingSku, setListingSku] = useState('');
   const [listingPrice, setListingPrice] = useState('1299');
+  const [listingCostPrice, setListingCostPrice] = useState('0');
   const [listingStock, setListingStock] = useState('50');
+  const [uploadedImageUrl, setUploadedImageUrl] = useState(null);
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isSavingMasterProduct, setIsSavingMasterProduct] = useState(false);
   const [masterProductSuccess, setMasterProductSuccess] = useState(null);
 
@@ -200,6 +203,7 @@ export default function AIStudioOverview() {
 
     setVisionFile(file);
     setVisionPreview(URL.createObjectURL(file));
+    setUploadedImageUrl(null);
     setVisionToken(null);
     setVisionTokenExpiry(null);
     setRawVisionData(null);
@@ -219,6 +223,7 @@ export default function AIStudioOverview() {
     }
     setVisionFile(null);
     setVisionPreview(null);
+    setUploadedImageUrl(null);
     setVisionError(null);
     setVisionProgress(0);
     setVisionToken(null);
@@ -617,6 +622,12 @@ export default function AIStudioOverview() {
   const handleApproveAndCreateMasterProduct = async () => {
     setListingError(null);
 
+    // 1. Guard against duplicate concurrent submissions
+    if (isSavingMasterProduct || isUploadingImage) {
+      return;
+    }
+
+    // 2. Validate essential fields
     if (!listingTitle.trim()) {
       setListingError('Product Title cannot be empty.');
       return;
@@ -630,13 +641,74 @@ export default function AIStudioOverview() {
       return;
     }
 
+    // 3. Verify AIJob linkage identifier (result_id)
+    const aiJobId = draftMetadata?.result_id;
+    if (!aiJobId) {
+      setListingError('Missing AI generation linkage identifier (result_id). Please regenerate the listing draft before approving.');
+      return;
+    }
+
+    // 4. Permanent Image Persistence: Upload original visionFile or reuse cached URL
+    let permanentUrl = uploadedImageUrl;
+    if (!permanentUrl) {
+      if (!visionFile) {
+        setListingError('Original product photo is missing. Please re-upload the photo before approving.');
+        return;
+      }
+
+      setIsUploadingImage(true);
+      try {
+        const reader = new FileReader();
+        const base64Promise = new Promise((resolve, reject) => {
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = (err) => reject(new Error('Failed to read image file data.'));
+        });
+        reader.readAsDataURL(visionFile);
+        const base64Data = await base64Promise;
+
+        const uploadRes = await uploadProductImageApi({
+          image: base64Data,
+          fileName: visionFile.name || 'product-image.jpg',
+          mimeType: visionFile.type || 'image/jpeg',
+        });
+
+        permanentUrl =
+          uploadRes?.data?.secure_url ||
+          uploadRes?.data?.url ||
+          uploadRes?.data?.local_url ||
+          uploadRes?.secure_url ||
+          uploadRes?.url ||
+          uploadRes?.local_url;
+
+        if (!permanentUrl) {
+          throw new Error('Image upload succeeded but did not return a valid permanent image URL.');
+        }
+
+        // Cache the uploaded URL in component state so any subsequent creation retry does not re-upload
+        setUploadedImageUrl(permanentUrl);
+      } catch (uploadErr) {
+        setListingError(`Image upload failed: ${uploadErr.message || 'Unable to store product image.'}`);
+        setIsUploadingImage(false);
+        return; // Do NOT proceed to product creation if image upload fails
+      } finally {
+        setIsUploadingImage(false);
+      }
+    }
+
+    // Safety check: ensure permanentUrl is never a temporary blob or data URI
+    if (!permanentUrl || permanentUrl.startsWith('blob:') || permanentUrl.startsWith('data:')) {
+      setListingError('Invalid image URL: Temporary browser blob/data URLs cannot be persisted in the catalog.');
+      return;
+    }
+
+    // 5. Submit Master Product Creation with complete AI-generated listing fields
     setIsSavingMasterProduct(true);
 
     try {
       const attributeMap = {};
       if (Array.isArray(listingAttributes)) {
         listingAttributes.forEach((attr) => {
-          if (attr.name && attr.value) {
+          if (attr.name && attr.value !== undefined && attr.value !== null && String(attr.value).trim() !== '') {
             attributeMap[attr.name] = String(attr.value).trim();
           }
         });
@@ -646,24 +718,33 @@ export default function AIStudioOverview() {
         title: listingTitle.trim(),
         shortDescription: listingShortDesc.trim(),
         description: listingDesc.trim(),
+        brand: listingBrand.trim() || 'Bhartiye Crafts',
+        productType: listingProductType.trim(),
         category: listingCategoryPrimary || 'Fashion',
         categoryName: listingCategoryPrimary || 'Fashion',
-        brand: listingBrand.trim() || 'Bhartiye Crafts',
+        subcategory: listingCategorySub.trim(),
+        bulletPoints: Array.isArray(listingBulletPoints)
+          ? listingBulletPoints.map((bp) => String(bp).trim()).filter(Boolean)
+          : [],
+        keywords: Array.isArray(listingKeywords) ? listingKeywords : [],
+        attributes: attributeMap,
+        material: attributeMap.material || attributeMap.Material || attributeMap.wood_type || '',
+        color: attributeMap.primary_color || attributeMap.color || attributeMap.Color || '',
+        seo: {
+          title: listingSeo?.meta_title || listingSeo?.title || listingTitle.trim(),
+          description: listingSeo?.meta_description || listingSeo?.description || listingShortDesc.trim(),
+          keywords: Array.isArray(listingKeywords) ? listingKeywords : [],
+          slug: listingSeo?.slug || '',
+        },
         sku: listingSku.trim().toUpperCase(),
         masterPrice: Number(listingPrice),
-        material: attributeMap.material || attributeMap.wood_type || '',
-        color: attributeMap.primary_color || attributeMap.color || '',
+        costPrice: Number(listingCostPrice) || 0,
         stock: Number(listingStock) || 0,
-        attributes: attributeMap,
-        keywords: listingKeywords,
+        images: [permanentUrl],
         tags: ['ai-vision-grounded', ...(listingIsFallback ? ['grounded-fallback'] : ['llm-generated'])],
-        seo: {
-          title: listingSeo?.meta_title || listingTitle.trim(),
-          description: listingSeo?.meta_description || listingShortDesc.trim(),
-          keywords: listingKeywords,
-        },
-        aiGenerated: true,
+        aiJobId: aiJobId,
         aiApproved: true,
+        aiGenerated: true,
       };
 
       const res = await createProductApi(payload);
@@ -1926,12 +2007,29 @@ export default function AIStudioOverview() {
                       <p className="text-blue-700 text-xs font-medium truncate hover:underline cursor-pointer">
                         {listingSeo?.meta_title || listingTitle}
                       </p>
-                      <p className="text-[10px] text-emerald-700 truncate">
+                      <p className="text-[10px] text-emerald-700 truncate font-mono">
                         https://bhartiyecrafts.com/products/{listingSeo?.slug || 'handcrafted-item'}
                       </p>
                       <p className="text-[11px] text-slate-600 line-clamp-2">
                         {listingSeo?.meta_description || listingShortDesc || listingDesc}
                       </p>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                        URL Slug (SEO)
+                      </label>
+                      <input
+                        type="text"
+                        value={listingSeo?.slug || ''}
+                        onChange={(e) =>
+                          setListingSeo((prev) => ({
+                            ...prev,
+                            slug: e.target.value.toLowerCase().trim().replace(/[^a-z0-9-_]/g, '-'),
+                          }))
+                        }
+                        placeholder="e.g. jaipur-blue-pottery-vase"
+                        className="w-full p-2 border border-slate-200 rounded-lg text-xs font-mono text-slate-700"
+                      />
                     </div>
                   </div>
 
@@ -1961,7 +2059,7 @@ export default function AIStudioOverview() {
                         />
                       </div>
 
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-3 gap-2">
                         <div>
                           <label className="block font-bold text-[11px] text-slate-700 mb-1">
                             Master Price (₹) <span className="text-red-500">*</span>
@@ -1976,7 +2074,19 @@ export default function AIStudioOverview() {
                         </div>
                         <div>
                           <label className="block font-bold text-[11px] text-slate-700 mb-1">
-                            Inventory Stock
+                            Cost Price (₹)
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={listingCostPrice}
+                            onChange={(e) => setListingCostPrice(e.target.value)}
+                            className="w-full p-2 border border-slate-300 rounded-lg text-xs text-slate-900"
+                          />
+                        </div>
+                        <div>
+                          <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                            Stock
                           </label>
                           <input
                             type="number"
@@ -1988,9 +2098,26 @@ export default function AIStudioOverview() {
                         </div>
                       </div>
 
+                      {uploadedImageUrl ? (
+                        <div className="p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-800 flex items-center justify-between">
+                          <span className="flex items-center gap-1 font-medium truncate">
+                            <Check className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
+                            Photo uploaded & cached
+                          </span>
+                          <span className="text-[10px] text-emerald-600 font-mono truncate max-w-[130px]">{uploadedImageUrl}</span>
+                        </div>
+                      ) : (
+                        <div className="p-2 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600 flex items-center gap-1.5">
+                          <ImageIcon className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+                          <span>Photo will be uploaded to storage upon approval</span>
+                        </div>
+                      )}
+
                       <div className="p-2.5 bg-white border border-emerald-200 rounded-lg text-[10px] text-emerald-800 space-y-0.5">
                         <span className="font-bold block">✓ Catalog Persistence Rules:</span>
                         <span>• Grounded attributes map directly to Product attribute Map</span>
+                        <br />
+                        <span>• Permanent photo URL stored in images[0]</span>
                         <br />
                         <span>• Multi-marketplace publishing disabled until Phase 03.5</span>
                       </div>
@@ -1998,10 +2125,15 @@ export default function AIStudioOverview() {
                       <button
                         type="button"
                         onClick={handleApproveAndCreateMasterProduct}
-                        disabled={isSavingMasterProduct || !listingSku.trim() || !listingPrice}
+                        disabled={isSavingMasterProduct || isUploadingImage || !listingSku.trim() || !listingPrice}
                         className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
                       >
-                        {isSavingMasterProduct ? (
+                        {isUploadingImage ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Uploading Product Photo...</span>
+                          </>
+                        ) : isSavingMasterProduct ? (
                           <>
                             <RefreshCw className="w-4 h-4 animate-spin" />
                             <span>Persisting Master Product in Catalog...</span>
@@ -2053,6 +2185,12 @@ export default function AIStudioOverview() {
                 <div className="flex justify-between border-b border-slate-100 pb-2">
                   <span className="text-slate-500">Category:</span>
                   <span className="font-medium text-slate-800">{listingCategoryPrimary || 'Fashion'}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2 items-center">
+                  <span className="text-slate-500">Persistent Photo:</span>
+                  <span className="font-mono text-emerald-700 text-[11px] truncate max-w-xs">
+                    {masterProductSuccess?.images?.[0] || uploadedImageUrl || 'Saved'}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500">Catalog ID:</span>

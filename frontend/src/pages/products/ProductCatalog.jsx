@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Package, Plus, Search, Filter, Eye, Edit, Trash2, RefreshCw, AlertCircle } from 'lucide-react';
+import { Package, Plus, Search, Filter, Eye, Edit, Trash2, RefreshCw, AlertCircle, Sparkles } from 'lucide-react';
 import { getProductsApi, deleteProductApi } from '../../services/productService';
 import { getCategoriesApi } from '../../services/categoryService';
 import ProductImage from '../../components/common/ProductImage';
@@ -205,8 +205,19 @@ export default function ProductCatalog() {
                           iconClassName="w-4 h-4"
                         />
                         <div>
-                          <span className="font-bold text-slate-900 block">{title}</span>
-                          <span className="text-[11px] text-slate-400">{product.brand || 'Bhartiye Crafts'}</span>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-bold text-slate-900">{title}</span>
+                            {product.aiGenerated && product.aiApproved && (
+                              <span
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200/70 rounded text-[9px] font-semibold tracking-wide shrink-0"
+                                title="AI-generated · Seller approved"
+                              >
+                                <Sparkles className="w-2.5 h-2.5 text-indigo-500" />
+                                <span>AI Approved</span>
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[11px] text-slate-400 block">{product.brand || 'Bhartiye Crafts'}</span>
                         </div>
                       </div>
                     </td>

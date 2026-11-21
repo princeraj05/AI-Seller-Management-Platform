@@ -93,14 +93,24 @@ export default function ProductDetails() {
         {/* Product Information */}
         <div className="md:col-span-2 space-y-4">
           <div>
-            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-              product.status === 'Active' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
-            }`}>
-              {product.status || 'Active'}
-            </span>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                product.status === 'Active' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+              }`}>
+                {product.status || 'Active'}
+              </span>
+              {product.aiGenerated && product.aiApproved && (
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-50 border border-indigo-200 text-indigo-700">
+                  <Sparkles className="w-3 h-3 text-indigo-500" />
+                  AI-generated · Seller approved
+                </span>
+              )}
+            </div>
             <h1 className="text-xl font-bold text-slate-900 mt-1">{title}</h1>
             <p className="text-slate-500 text-xs">
               SKU: {product.sku} • Brand: {product.brand || 'Bhartiye Crafts'} • Category: {category}
+              {product.subcategory ? ` / ${product.subcategory}` : ''}
+              {product.productType ? ` • Type: ${product.productType}` : ''}
             </p>
           </div>
 
@@ -118,6 +128,50 @@ export default function ProductDetails() {
               <p className="text-slate-600 leading-relaxed">{product.description}</p>
             </div>
           )}
+
+          {/* Key Highlights / Bullet Points */}
+          {Array.isArray(product.bulletPoints) && product.bulletPoints.length > 0 && (
+            <div>
+              <h3 className="font-bold text-slate-800 mb-1.5">Key Highlights</h3>
+              <ul className="list-disc pl-4 space-y-1 text-slate-600 leading-relaxed">
+                {product.bulletPoints.map((bp, idx) => (
+                  <li key={idx}>{bp}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Specifications & Attributes */}
+          {(() => {
+            const attributeEntries = product.attributes
+              ? product.attributes instanceof Map
+                ? Array.from(product.attributes.entries())
+                : typeof product.attributes === 'object'
+                ? Object.entries(product.attributes)
+                : []
+              : [];
+            const validEntries = attributeEntries.filter(
+              ([k, v]) => k && v !== undefined && v !== null && String(v).trim() !== ''
+            );
+
+            if (validEntries.length === 0) return null;
+
+            return (
+              <div>
+                <h3 className="font-bold text-slate-800 mb-2">Specifications & Attributes</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80">
+                  {validEntries.map(([k, v]) => (
+                    <div key={k} className="space-y-0.5">
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block">
+                        {k.replace(/_/g, ' ')}
+                      </span>
+                      <span className="font-medium text-slate-800 text-xs block">{String(v)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Connected Marketplace Badges */}
           <div>
@@ -147,6 +201,9 @@ export default function ProductDetails() {
             <ul className="list-disc pl-4 space-y-1 text-slate-600">
               <li>Master SKU {product.sku} is properly formatted for multi-channel listing.</li>
               <li>Master price ₹{product.masterPrice} is synchronized across active channel rules.</li>
+              {product.aiApproved && (
+                <li>Grounded product intelligence verified and approved by seller.</li>
+              )}
             </ul>
           </div>
         </div>

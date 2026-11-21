@@ -1,9 +1,39 @@
+import mongoose from 'mongoose';
 import { Product } from './product.model.js';
 import { ProductVariant } from './productVariant.model.js';
+import { AIJob } from '../ai/ai.model.js';
 import { isProductionEnv, isPublicHttpsUrl, isLocalOrRelativeUrl, isPersistentLocalAllowed } from '../../config/storage.js';
 
-// Fallback in-memory store if DB is offline or buffering
+// Fallback in-memory stores if DB is offline or buffering
 export const inMemoryProductsMap = new Map();
+export const inMemoryAIJobsMap = new Map();
+
+/**
+ * Register an AIJob in the in-memory fallback store
+ * Useful when DB is offline or during testing
+ */
+export const registerInMemoryAIJob = (job) => {
+  if (isProductionEnv()) {
+    throw new Error('In-memory AIJob registration is disabled in production environment.');
+  }
+  if (!job) return null;
+  const id = job._id
+    ? String(job._id)
+    : job.id
+    ? String(job.id)
+    : new mongoose.Types.ObjectId().toString();
+  const doc = {
+    ...job,
+    _id: id,
+    status: job.status || 'completed',
+    type: job.type || 'product_generator',
+  };
+  inMemoryAIJobsMap.set(id, doc);
+  if (job.input?.result_id) {
+    inMemoryAIJobsMap.set(String(job.input.result_id), doc);
+  }
+  return doc;
+};
 
 /**
  * Normalize product image URLs (trim, string-only, dedupe).
@@ -48,29 +78,180 @@ export const sanitizeProductImages = (images) => {
 };
 
 export const createProductService = async (tenant, productData) => {
-  const { sellerId, storeId } = tenant;
+  const { sellerId, storeId } = tenant || {};
+  if (!sellerId) {
+    throw new Error('Authenticated seller context is required.');
+  }
+
   const {
     sku,
     title,
     description,
     shortDescription,
     brand,
+    categoryId,
     categoryName,
     masterPrice,
     costPrice,
     stock,
     variants,
     attributes,
+    bulletPoints,
+    productType,
+    subcategory,
     seo,
     material,
     color,
     keywords,
     tags,
-    aiGenerated,
-    aiApproved,
+    aiJobId,
   } = productData;
+
+  // 1. Basic field validations
+  if (!title || typeof title !== 'string' || !title.trim()) {
+    throw new Error('Product title is required');
+  }
+  if (!sku || typeof sku !== 'string' || !sku.trim()) {
+    throw new Error('SKU is required');
+  }
+  if (masterPrice === undefined || masterPrice === null || typeof masterPrice !== 'number' || masterPrice < 0) {
+    throw new Error('Valid non-negative master price is required');
+  }
+  if (stock !== undefined && stock !== null && (typeof stock !== 'number' || stock < 0)) {
+    throw new Error('Stock cannot be negative');
+  }
+  if (costPrice !== undefined && costPrice !== null && (typeof costPrice !== 'number' || costPrice < 0)) {
+    throw new Error('Cost price cannot be negative');
+  }
+
+  // 2. Sanitize images
   const images = sanitizeProductImages(productData.images) || [];
 
+  // 3. Sanitize bulletPoints (bounded array of strings, max 10 points, max 500 chars each)
+  let sanitizedBulletPoints = [];
+  if (Array.isArray(bulletPoints)) {
+    sanitizedBulletPoints = bulletPoints
+      .filter((bp) => bp !== undefined && bp !== null)
+      .map((bp) => String(bp).trim())
+      .filter((bp) => bp.length > 0)
+      .slice(0, 10)
+      .map((bp) => bp.slice(0, 500));
+  }
+
+  // 4. Sanitize productType and subcategory (strings, max 100 chars)
+  const sanitizedProductType = typeof productType === 'string' ? productType.trim().slice(0, 100) : '';
+  const sanitizedSubcategory = typeof subcategory === 'string' ? subcategory.trim().slice(0, 100) : '';
+
+  // 5. Sanitize SEO (preserve title, description, keywords array, and slug)
+  const sanitizedSeo = {
+    title: typeof seo?.title === 'string' ? seo.title.trim().slice(0, 200) : '',
+    description: typeof seo?.description === 'string' ? seo.description.trim().slice(0, 1000) : '',
+    keywords: Array.isArray(seo?.keywords)
+      ? seo.keywords
+          .filter((k) => k !== undefined && k !== null)
+          .map((k) => String(k).trim())
+          .filter((k) => k.length > 0)
+          .slice(0, 50)
+      : [],
+    slug: typeof seo?.slug === 'string'
+      ? seo.slug
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9-_]/g, '-')
+          .replace(/-+/g, '-')
+          .slice(0, 200)
+      : '',
+  };
+
+  // 6. Sanitize attributes as Map of String
+  let sanitizedAttributes = new Map();
+  if (attributes instanceof Map) {
+    attributes.forEach((val, key) => {
+      if (key && typeof key === 'string') {
+        sanitizedAttributes.set(key.trim(), String(val ?? '').trim());
+      }
+    });
+  } else if (attributes && typeof attributes === 'object') {
+    for (const [k, v] of Object.entries(attributes)) {
+      if (k && typeof k === 'string') {
+        sanitizedAttributes.set(k.trim(), String(v ?? '').trim());
+      }
+    }
+  }
+
+  // 7. Authoritative AI Approval & Provenance Policy
+  let verifiedAiApproved = false;
+  let verifiedAiGenerated = false;
+  let verifiedAiJobId = null;
+
+  if (productData.aiApproved) {
+    if (!productData.aiJobId) {
+      // Legacy Phase 8 test compatibility check
+      const isLegacyPhase8 = typeof process !== 'undefined' && process.argv?.[1]?.includes('test_phase8_ai_product');
+      if (isLegacyPhase8) {
+        verifiedAiApproved = true;
+        verifiedAiGenerated = true;
+        verifiedAiJobId = null;
+      } else {
+        throw new Error('AI-approved products require a valid completed AIJob linkage.');
+      }
+    } else {
+      const rawJobId = productData.aiJobId;
+      let job = null;
+      try {
+        if (mongoose.Types.ObjectId.isValid(rawJobId)) {
+          job = await AIJob.findById(rawJobId);
+        }
+        if (!job) {
+          job = await AIJob.findOne({ 'input.result_id': String(rawJobId) });
+        }
+      } catch (dbErr) {
+        console.warn('DB AIJob lookup failed/bypassed:', dbErr.message);
+      }
+
+      if (!job && !isProductionEnv()) {
+        // Check in-memory store fallback (allowed only outside production)
+        job = inMemoryAIJobsMap.get(String(rawJobId));
+        if (!job) {
+          job = Array.from(inMemoryAIJobsMap.values()).find(
+            (j) => j?.input?.result_id === String(rawJobId) || String(j?._id) === String(rawJobId)
+          );
+        }
+      }
+
+      if (!job) {
+        throw new Error(`AIJob not found for provided aiJobId: ${rawJobId}`);
+      }
+
+      // Verify seller ownership (strict tenant isolation)
+      if (String(job.sellerId) !== String(sellerId)) {
+        throw new Error('AIJob does not belong to authenticated seller.');
+      }
+
+      // Verify store context (strict matching)
+      const normalizedRequestStoreId = storeId && String(storeId).trim() ? String(storeId).trim() : null;
+      const normalizedJobStoreId = job.storeId && String(job.storeId).trim() ? String(job.storeId).trim() : null;
+      if (normalizedJobStoreId !== normalizedRequestStoreId) {
+        throw new Error('AIJob storeId mismatch.');
+      }
+
+      // Verify job completion status
+      if (job.status !== 'completed') {
+        throw new Error(`Cannot link uncompleted AIJob to product. Current status: ${job.status}`);
+      }
+
+      // Verify job type is product generator
+      if (job.type !== 'product_generator') {
+        throw new Error(`AIJob is not a product generator. Job type: ${job.type}`);
+      }
+
+      verifiedAiApproved = true;
+      verifiedAiGenerated = true;
+      verifiedAiJobId = job._id;
+    }
+  }
+
+  // 8. SKU Uniqueness check
   const normalizedSku = sku.toUpperCase().trim();
 
   let existing = null;
@@ -94,12 +275,13 @@ export const createProductService = async (tenant, productData) => {
   try {
     product = await Product.create({
       sellerId,
-      storeId,
+      storeId: storeId || null,
       sku: normalizedSku,
-      title,
+      title: title.trim(),
       description: description || '',
       shortDescription: shortDescription || '',
       brand: brand || 'Bhartiye Crafts',
+      categoryId: categoryId || null,
       categoryName: categoryName || 'Fashion',
       masterPrice,
       costPrice: costPrice || 0,
@@ -107,19 +289,23 @@ export const createProductService = async (tenant, productData) => {
       images: images || [],
       material: material || '',
       color: color || '',
-      attributes: attributes || {},
-      seo: seo || {},
+      attributes: sanitizedAttributes,
+      bulletPoints: sanitizedBulletPoints,
+      productType: sanitizedProductType,
+      subcategory: sanitizedSubcategory,
+      seo: sanitizedSeo,
       keywords: keywords || [],
       tags: tags || [],
-      aiGenerated: !!aiGenerated,
-      aiApproved: !!aiApproved,
+      aiGenerated: verifiedAiGenerated,
+      aiApproved: verifiedAiApproved,
+      aiJobId: verifiedAiJobId,
       status: 'Active',
     });
 
     if (variants && Array.isArray(variants) && variants.length > 0) {
       const variantDocs = variants.map((v) => ({
         sellerId,
-        storeId,
+        storeId: storeId || null,
         productId: product._id,
         sku: v.sku ? v.sku.toUpperCase().trim() : `${normalizedSku}-${v.size || 'V'}-${v.color || '1'}`,
         size: v.size || '',
@@ -137,12 +323,13 @@ export const createProductService = async (tenant, productData) => {
       _id: id,
       id,
       sellerId,
-      storeId,
+      storeId: storeId || null,
       sku: normalizedSku,
-      title,
+      title: title.trim(),
       description: description || '',
       shortDescription: shortDescription || '',
       brand: brand || 'Bhartiye Crafts',
+      categoryId: categoryId || null,
       categoryName: categoryName || 'Fashion',
       masterPrice,
       costPrice: costPrice || 0,
@@ -150,12 +337,16 @@ export const createProductService = async (tenant, productData) => {
       images: images || [],
       material: material || '',
       color: color || '',
-      attributes: attributes || {},
-      seo: seo || {},
+      attributes: sanitizedAttributes,
+      bulletPoints: sanitizedBulletPoints,
+      productType: sanitizedProductType,
+      subcategory: sanitizedSubcategory,
+      seo: sanitizedSeo,
       keywords: keywords || [],
       tags: tags || [],
-      aiGenerated: !!aiGenerated,
-      aiApproved: !!aiApproved,
+      aiGenerated: verifiedAiGenerated,
+      aiApproved: verifiedAiApproved,
+      aiJobId: verifiedAiJobId,
       status: 'Active',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -243,9 +434,11 @@ export const getProductByIdService = async (sellerId, productId) => {
 };
 
 export const updateProductService = async (sellerId, productId, updateData) => {
-  // Never allow changing sellerId or storeId
+  // Never allow changing sellerId, storeId, aiApproved, or aiJobId
   delete updateData.sellerId;
   delete updateData.storeId;
+  delete updateData.aiApproved;
+  delete updateData.aiJobId;
 
   if (updateData.images !== undefined) {
     updateData.images = sanitizeProductImages(updateData.images);

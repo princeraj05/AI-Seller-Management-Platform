@@ -58,6 +58,7 @@ const productSchema = new mongoose.Schema(
     costPrice: {
       type: Number,
       default: 0,
+      min: 0,
     },
     masterPrice: {
       type: Number,
@@ -87,10 +88,25 @@ const productSchema = new mongoose.Schema(
       of: String,
       default: {},
     },
+    bulletPoints: {
+      type: [String],
+      default: [],
+    },
+    productType: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    subcategory: {
+      type: String,
+      default: '',
+      trim: true,
+    },
     seo: {
       title: { type: String, default: '' },
       description: { type: String, default: '' },
       keywords: { type: [String], default: [] },
+      slug: { type: String, default: '', trim: true },
     },
     keywords: {
       type: [String],
@@ -112,6 +128,11 @@ const productSchema = new mongoose.Schema(
     aiApproved: {
       type: Boolean,
       default: false,
+    },
+    aiJobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AIJob',
+      default: null,
     },
   },
   {
