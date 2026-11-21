@@ -46,6 +46,11 @@ export default function AIStudioOverview() {
   const [visionProgress, setVisionProgress] = useState(0);
   const [visionError, setVisionError] = useState(null);
   const [copiedOcr, setCopiedOcr] = useState(false);
+  const [visionToken, setVisionToken] = useState(null);
+  const [visionTokenExpiry, setVisionTokenExpiry] = useState(null);
+  const isVisionTokenExpired = Boolean(
+    visionTokenExpiry && new Date(visionTokenExpiry).getTime() <= Date.now()
+  );
 
   // Validated Vision Result & Editable Fields
   const [visionProductType, setVisionProductType] = useState('');
@@ -145,6 +150,8 @@ export default function AIStudioOverview() {
 
     setVisionFile(file);
     setVisionPreview(URL.createObjectURL(file));
+    setVisionToken(null);
+    setVisionTokenExpiry(null);
   };
 
   const handleRemoveFile = () => {
@@ -155,6 +162,8 @@ export default function AIStudioOverview() {
     setVisionPreview(null);
     setVisionError(null);
     setVisionProgress(0);
+    setVisionToken(null);
+    setVisionTokenExpiry(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -163,6 +172,8 @@ export default function AIStudioOverview() {
   const handleAnalyzePhoto = async (e) => {
     e?.preventDefault();
     setVisionError(null);
+    setVisionToken(null);
+    setVisionTokenExpiry(null);
 
     if (!visionFile) {
       setVisionError('Please select or drop a product image to analyze.');
@@ -192,6 +203,11 @@ export default function AIStudioOverview() {
         throw new Error('AI service response did not contain validated vision data.');
       }
 
+      const token = res?.data?.vision_token || res?.vision_token || null;
+      const expiresAt = res?.data?.expires_at || res?.expires_at || null;
+      setVisionToken(token);
+      setVisionTokenExpiry(expiresAt);
+
       setVisionProductType(v.product_type || '');
       setVisionVisualDescription(v.visual_description || '');
       setVisionCategory(v.category || {
@@ -218,6 +234,8 @@ export default function AIStudioOverview() {
 
       setVisionStep(2); // Advance to Review & Edit Step
     } catch (err) {
+      setVisionToken(null);
+      setVisionTokenExpiry(null);
       setVisionError(err.message || 'Vision analysis failed. Please verify AI microservice connection.');
     } finally {
       setIsAnalyzingVision(false);
@@ -741,6 +759,8 @@ export default function AIStudioOverview() {
                   type="button"
                   onClick={() => {
                     setVisionStep(1);
+                    setVisionToken(null);
+                    setVisionTokenExpiry(null);
                     setVisionError(null);
                   }}
                   className="px-3.5 py-1.5 border border-slate-300 rounded-lg text-slate-700 font-bold hover:bg-slate-100 text-xs transition-colors"
@@ -766,6 +786,20 @@ export default function AIStudioOverview() {
                       <li key={i}>{u}</li>
                     ))}
                   </ul>
+                </div>
+              )}
+
+              {/* Token Expiry Warning Banner */}
+              {isVisionTokenExpired && (
+                <div className="p-4 bg-rose-50 border border-rose-300 rounded-xl text-rose-900 space-y-1">
+                  <div className="flex items-center gap-2 font-bold text-xs text-rose-800">
+                    <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+                    <span>Vision Provenance Token Expired</span>
+                  </div>
+                  <p className="text-[11px] text-rose-700">
+                    The short-lived cryptographic vision contract expired at{' '}
+                    {new Date(visionTokenExpiry).toLocaleTimeString()}. Please re-analyze the image to establish a valid cryptographic contract before generating a listing.
+                  </p>
                 </div>
               )}
 

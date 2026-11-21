@@ -37,3 +37,23 @@ export const analyzeProductImageApi = async (formData, onUploadProgress) => {
     throw new Error(error.message || 'Network error during image analysis');
   }
 };
+
+/**
+ * Validates vision provenance token and resolves effective product attributes
+ * combined with seller corrections.
+ *
+ * @param {Object} payload - { vision_token, seller_corrections, client_vision_data }
+ * @returns {Promise<Object>}
+ */
+export const validateVisionContractApi = async (payload) => {
+  try {
+    const response = await api.post('/ai/validate-contract', payload);
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      const serverMessage = error.response.data.message || error.response.data.error;
+      throw new Error(serverMessage || 'Vision contract validation failed');
+    }
+    throw new Error(error.message || 'Network error during contract validation');
+  }
+};

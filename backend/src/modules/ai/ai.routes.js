@@ -1,6 +1,6 @@
 import express from 'express';
 import { generateProductAI } from './ai.controller.js';
-import { analyzeProductImage } from './vision.controller.js';
+import { analyzeProductImage, validateVisionContract } from './vision.controller.js';
 import { authMiddleware } from '../../middleware/authMiddleware.js';
 import { tenantMiddleware } from '../../middleware/tenantMiddleware.js';
 import { authorizeRoles } from '../../middleware/rbacMiddleware.js';
@@ -14,5 +14,6 @@ router.use(authorizeRoles('seller', 'admin'));
 
 router.post('/generate-product', generateProductAI);
 router.post('/analyze-image', uploadProductImageMiddleware, analyzeProductImage);
+router.post('/validate-contract', validateVisionContract);
 
 export default router;
