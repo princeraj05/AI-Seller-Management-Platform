@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Search,
   Filter,
@@ -21,8 +21,8 @@ import {
   Layers,
   ArrowRight
 } from 'lucide-react';
-import { mockOrders } from '../../utils/mockData';
 import { getOrdersApi } from '../../services/orderService';
+import { fetchOrdersSafely } from '../../utils/ordersListHelpers';
 import {
   triggerAmazonOrdersSyncApi,
   getAmazonOrderDetailsApi,
@@ -39,8 +39,11 @@ export default function OrdersList() {
   const [ordersSearch, setOrdersSearch] = useState('');
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [ordersError, setOrdersError] = useState(null);
   const [syncingAmazon, setSyncingAmazon] = useState(false);
   const [syncMessage, setSyncMessage] = useState(null);
+  const syncingAmazonRef = useRef(false);
+  const syncingReturnsRef = useRef(false);
 
   // Drawer & Order Details State
   const [selectedOrder, setSelectedOrder] = useState(null);
@@ -53,6 +56,7 @@ export default function OrdersList() {
   // Returns & Refunds State
   const [returnsList, setReturnsList] = useState([]);
   const [returnsLoading, setReturnsLoading] = useState(false);
+  const [returnsError, setReturnsError] = useState(null);
   const [syncingReturns, setSyncingReturns] = useState(false);
   const [returnsStatus, setReturnsStatus] = useState(null);
   const [returnsSearch, setReturnsSearch] = useState('');
@@ -60,17 +64,13 @@ export default function OrdersList() {
 
   const fetchOrders = async () => {
     setLoading(true);
+    setOrdersError(null);
     try {
-      const res = await getOrdersApi();
-      const list = res?.orders || res?.data?.orders;
-      if (Array.isArray(list) && list.length > 0) {
-        setOrders(list);
-      } else {
-        setOrders(mockOrders);
+      const { orders: fetchedOrders, error } = await fetchOrdersSafely(getOrdersApi);
+      setOrders(fetchedOrders);
+      if (error) {
+        setOrdersError(error);
       }
-    } catch (err) {
-      console.warn('Backend API fetch error, using mock data:', err.message);
-      setOrders(mockOrders);
     } finally {
       setLoading(false);
     }
@@ -78,19 +78,21 @@ export default function OrdersList() {
 
   const fetchReturns = async () => {
     setReturnsLoading(true);
+    setReturnsError(null);
     try {
       const [returnsRes, statusRes] = await Promise.all([
         getAmazonReturnsApi({ search: returnsSearch, status: returnsFilter === 'All' ? undefined : returnsFilter }),
         getAmazonReturnsStatusApi().catch(() => null)
       ]);
       const list = returnsRes?.returns || returnsRes?.data?.returns || [];
-      setReturnsList(list);
+      setReturnsList(Array.isArray(list) ? list : []);
       if (statusRes?.status || statusRes?.data?.status) {
         setReturnsStatus(statusRes.status || statusRes.data.status);
       }
     } catch (err) {
       console.warn('Error fetching Amazon returns:', err.message);
       setReturnsList([]);
+      setReturnsError(err.message || 'Failed to load Amazon returns from the server.');
     } finally {
       setReturnsLoading(false);
     }
@@ -107,6 +109,9 @@ export default function OrdersList() {
   }, [activeTab, returnsFilter]);
 
   const handleSyncAmazonOrders = async () => {
+    if (syncingAmazon) return;
+    if (syncingAmazonRef.current) return;
+    syncingAmazonRef.current = true;
     setSyncingAmazon(true);
     setSyncMessage(null);
     try {
@@ -123,12 +128,16 @@ export default function OrdersList() {
         text: err.message || 'Failed to sync Amazon orders.',
       });
     } finally {
+      syncingAmazonRef.current = false;
       setSyncingAmazon(false);
       setTimeout(() => setSyncMessage(null), 8000);
     }
   };
 
   const handleSyncReturns = async () => {
+    if (syncingReturns) return;
+    if (syncingReturnsRef.current) return;
+    syncingReturnsRef.current = true;
     setSyncingReturns(true);
     setSyncMessage(null);
     try {
@@ -145,6 +154,7 @@ export default function OrdersList() {
         text: err.message || 'Failed to sync Amazon returns.',
       });
     } finally {
+      syncingReturnsRef.current = false;
       setSyncingReturns(false);
       setTimeout(() => setSyncMessage(null), 8000);
     }
@@ -350,6 +360,29 @@ export default function OrdersList() {
             </div>
           </div>
 
+          {/* Orders Fetch Error Banner */}
+          {ordersError && (
+            <div
+              role="alert"
+              className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs flex items-center justify-between gap-3"
+            >
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>
+                  <strong className="font-bold">Failed to load orders:</strong> {ordersError}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={fetchOrders}
+                disabled={loading}
+                className="px-2.5 py-1 bg-white hover:bg-rose-100 border border-rose-200 text-rose-700 rounded-lg text-[11px] font-semibold shrink-0 disabled:opacity-50"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
           {/* Orders Table */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
             <table className="w-full text-left">
@@ -366,7 +399,32 @@ export default function OrdersList() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filtered.length === 0 ? (
+                {loading ? (
+                  <tr>
+                    <td colSpan={8} className="p-10 text-center text-slate-400">
+                      <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-amber-500" />
+                      Loading orders from server...
+                    </td>
+                  </tr>
+                ) : ordersError ? (
+                  <tr>
+                    <td colSpan={8} className="p-10 text-center text-rose-600">
+                      <AlertCircle className="w-8 h-8 mx-auto mb-2 text-rose-400" />
+                      <div className="font-semibold text-rose-700">Unable to load orders</div>
+                      <div className="text-[11px] text-rose-500 mt-1">{ordersError}</div>
+                    </td>
+                  </tr>
+                ) : orders.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="p-10 text-center text-slate-400">
+                      <ShoppingBag className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                      <div className="font-semibold text-slate-600">No orders found in the database.</div>
+                      <div className="text-[11px] text-slate-400 mt-1">
+                        Click "Sync Amazon Orders" to pull orders from Amazon SP-API or connect a sales channel.
+                      </div>
+                    </td>
+                  </tr>
+                ) : filtered.length === 0 ? (
                   <tr>
                     <td colSpan={8} className="p-8 text-center text-slate-400">
                       <ShoppingBag className="w-8 h-8 mx-auto mb-2 opacity-30" />
@@ -576,7 +634,22 @@ export default function OrdersList() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {returnsList.length === 0 ? (
+                {returnsLoading ? (
+                  <tr>
+                    <td colSpan={8} className="p-10 text-center text-slate-400">
+                      <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-purple-500" />
+                      Loading Amazon returns and refunds...
+                    </td>
+                  </tr>
+                ) : returnsError ? (
+                  <tr>
+                    <td colSpan={8} className="p-10 text-center text-rose-600">
+                      <AlertCircle className="w-8 h-8 mx-auto mb-2 text-rose-400" />
+                      <div className="font-semibold text-rose-700">Unable to load returns</div>
+                      <div className="text-[11px] text-rose-500 mt-1">{returnsError}</div>
+                    </td>
+                  </tr>
+                ) : returnsList.length === 0 ? (
                   <tr>
                     <td colSpan={8} className="p-8 text-center text-slate-400">
                       <RotateCcw className="w-8 h-8 mx-auto mb-2 opacity-30" />

@@ -282,7 +282,10 @@ export const validateListingData = (arg1 = {}, arg2 = {}) => {
   } else if (mappedAttributes.mainImage || mappedAttributes.main_image) {
     images = [mappedAttributes.mainImage || mappedAttributes.main_image, ...(mappedAttributes.otherImages || [])];
   } else if (Array.isArray(product.images) && product.images.length > 0) {
-    images = product.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean);
+    images = product.images
+      .map((img) => (img && typeof img === 'object' ? (img.secure_url || img.url || '') : img))
+      .map((img) => (typeof img === 'string' ? img.trim() : img))
+      .filter(Boolean);
   }
 
   // 1. Title Validation
@@ -452,7 +455,10 @@ export const buildSpApiListingPayload = (arg1 = {}, arg2 = {}) => {
   } else if (mappedAttributes.mainImage || mappedAttributes.main_image) {
     images = [mappedAttributes.mainImage || mappedAttributes.main_image, ...(mappedAttributes.otherImages || [])];
   } else if (Array.isArray(product.images) && product.images.length > 0) {
-    images = product.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean);
+    images = product.images
+      .map((img) => (img && typeof img === 'object' ? (img.secure_url || img.url || '') : img))
+      .map((img) => (typeof img === 'string' ? img.trim() : img))
+      .filter(Boolean);
   }
 
   const rawBullets = Array.isArray(mappedAttributes.bulletPoints || mappedAttributes.bullet_point) && (mappedAttributes.bulletPoints || mappedAttributes.bullet_point).length > 0
@@ -792,7 +798,14 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       description: submission.mappedAttributes?.description || 'Demo Product Description for testing.',
       masterPrice: submission.mappedAttributes?.standard_price || 999,
       stock: submission.mappedAttributes?.quantity || 10,
-      images: submission.mappedAttributes?.images || ['https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=800'],
+      images: Array.isArray(submission.mappedAttributes?.images)
+        ? submission.mappedAttributes.images
+        : submission.mappedAttributes?.mainImage || submission.mappedAttributes?.main_image
+        ? [
+            submission.mappedAttributes.mainImage || submission.mappedAttributes.main_image,
+            ...(Array.isArray(submission.mappedAttributes?.otherImages) ? submission.mappedAttributes.otherImages : []),
+          ].filter(Boolean)
+        : [],
       status: 'Active',
       aiApproved: true,
     };

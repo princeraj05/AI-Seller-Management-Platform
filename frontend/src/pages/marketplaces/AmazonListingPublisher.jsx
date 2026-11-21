@@ -38,23 +38,40 @@ import {
   getAmazonListingSubmissionsApi,
   getAmazonListingSubmissionByIdApi,
 } from '../../services/channelService';
-import { resolveProductImageUrl } from '../../utils/imageUrl';
+import { ASSET_BASE_URL } from '../../utils/imageUrl';
+import {
+  selectProductImages,
+  inspectListingImageUrl,
+  normalizeListingValidationResponse,
+  resolveSchemaValidationBadge,
+  formatValidationSourceLabel,
+  canProceedToListingSubmission,
+} from '../../utils/amazonListingHelpers';
 import { useSearchParams } from 'react-router-dom';
 import { getProductByIdApi } from '../../services/productService';
 
 function ProductThumbnail({ src, alt, className = '', iconClassName = 'w-6 h-6 text-slate-400' }) {
+  const inspection = inspectListingImageUrl(src, ASSET_BASE_URL);
+  const resolvedSrc = inspection.displayable ? inspection.resolvedUrl : null;
   const [hasError, setHasError] = useState(false);
-  const [loading, setLoading] = useState(Boolean(src));
+  const [loading, setLoading] = useState(Boolean(resolvedSrc));
 
   useEffect(() => {
     setHasError(false);
-    setLoading(Boolean(src));
-  }, [src]);
+    setLoading(Boolean(resolvedSrc));
+  }, [resolvedSrc]);
 
-  if (!src || hasError) {
+  if (!resolvedSrc || hasError) {
+    const isInvalidOrBroken = Boolean(src) && (!inspection.displayable || hasError);
+    const PlaceholderIcon = isInvalidOrBroken ? ImageOff : Package;
     return (
-      <div className={`bg-slate-100 flex items-center justify-center text-slate-400 ${className}`}>
-        <Package className={iconClassName} />
+      <div
+        className={`bg-slate-100 flex items-center justify-center text-slate-400 ${className}`}
+        role="img"
+        aria-label={isInvalidOrBroken ? `${alt || 'Product'} (image unavailable)` : `${alt || 'Product'} (no image)`}
+        title={isInvalidOrBroken ? (inspection.reason || 'Image unavailable') : 'No product image'}
+      >
+        <PlaceholderIcon className={iconClassName} />
       </div>
     );
   }
@@ -67,7 +84,7 @@ function ProductThumbnail({ src, alt, className = '', iconClassName = 'w-6 h-6 t
         </div>
       )}
       <img
-        src={resolveProductImageUrl(src)}
+        src={resolvedSrc}
         alt={alt || 'Product'}
         onLoad={() => setLoading(false)}
         onError={() => {
@@ -126,6 +143,7 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
 
   // Validation & Submission States
   const [validationResult, setValidationResult] = useState(null);
+  const [validatedFingerprint, setValidatedFingerprint] = useState(null);
   const [validating, setValidating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submissionRecord, setSubmissionRecord] = useState(null);
@@ -135,47 +153,63 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
   const [successMessage, setSuccessMessage] = useState(null);
 
   // Image Verification States
+  const mainImageInspection = inspectListingImageUrl(formData.mainImage, ASSET_BASE_URL);
   const [mainImageState, setMainImageState] = useState('idle'); // 'idle' | 'checking' | 'valid' | 'broken'
   const [mainImageError, setMainImageError] = useState(null);
 
-  // Auto-verify main image accessibility when URL changes
+  // Auto-verify main image accessibility when URL changes (with cancellation to prevent cross-product race)
   useEffect(() => {
-    if (!formData.mainImage || !formData.mainImage.trim()) {
+    let cancelled = false;
+    const inspection = inspectListingImageUrl(formData.mainImage, ASSET_BASE_URL);
+
+    if (inspection.status === 'missing') {
       setMainImageState('idle');
       setMainImageError(null);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
-    const trimmed = formData.mainImage.trim();
-    const lower = trimmed.toLowerCase();
-    if (lower.startsWith('blob:') || lower.startsWith('data:') || lower.startsWith('file:') || /^[a-zA-Z]:[\\/]/.test(trimmed)) {
+
+    if (!inspection.displayable || !inspection.resolvedUrl) {
       setMainImageState('broken');
-      setMainImageError('Amazon rejects blob:, data:, and local filesystem paths. Images must be public HTTPS URLs.');
-      return;
+      setMainImageError(inspection.reason || 'Invalid product image URL.');
+      return () => {
+        cancelled = true;
+      };
     }
-    if (lower.startsWith('http://')) {
-      setMainImageState('broken');
-      setMainImageError('Amazon requires secure HTTPS image links. Insecure HTTP is rejected.');
-      return;
-    }
-    const isDevAsset = trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/');
-    if (!trimmed.startsWith('https://') && !isDevAsset) {
-      setMainImageState('broken');
-      setMainImageError('Amazon requires secure HTTPS image links (e.g. Cloudinary or S3) or local upload assets.');
-      return;
-    }
+
     setMainImageState('checking');
     setMainImageError(null);
     const imgTester = new Image();
     imgTester.onload = () => {
+      if (cancelled) return;
       setMainImageState('valid');
       setMainImageError(null);
     };
     imgTester.onerror = () => {
+      if (cancelled) return;
       setMainImageState('broken');
       setMainImageError('Image failed to load in browser. The URL may be inaccessible, hotlink-protected, or returning a 404/403 error.');
     };
-    imgTester.src = resolveProductImageUrl(trimmed);
+    imgTester.src = inspection.resolvedUrl;
+
+    return () => {
+      cancelled = true;
+    };
   }, [formData.mainImage]);
+
+  const currentValidationFingerprint = JSON.stringify({
+    productId: selectedProduct?._id || '',
+    productType: selectedProductType,
+    formData,
+  });
+  const isValidationStale = Boolean(
+    validationResult && validatedFingerprint && validatedFingerprint !== currentValidationFingerprint
+  );
+  const canProceedToSubmission = canProceedToListingSubmission(validationResult, {
+    validating,
+    isStale: isValidationStale,
+  });
 
   // History State
   const [historyList, setHistoryList] = useState([]);
@@ -190,10 +224,12 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
     fetchHistory();
   }, []);
 
-  // When selectedProductType changes, fetch schema
+  // When selectedProductType changes, fetch schema (or clear stale schema when empty)
   useEffect(() => {
     if (selectedProductType) {
       fetchSchema(selectedProductType);
+    } else {
+      setSchemaData(null);
     }
   }, [selectedProductType]);
 
@@ -288,21 +324,28 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
     if (!prod) return;
     setSelectedProduct(prod);
     setErrorMessage(null);
+    setSuccessMessage(null);
+    setValidationResult(null);
+    setValidatedFingerprint(null);
+    setSubmissionRecord(null);
+    setSubmissionResult(null);
+    setMainImageState('idle');
+    setMainImageError(null);
 
     const prodTitle = prod.title || prod.name || 'Demo Product';
     const prodBrand = prod.brand || 'Demo Brand';
     const prodCategory = prod.categoryName || prod.category || '';
     const prodSku = prod.sku || '';
 
-    // Auto-map attributes from central product
-    const imgList = Array.isArray(prod.images) ? prod.images : [];
-    // Keep stored URLs as-is for the Amazon payload; resolution is only for display
-    const mainImg = typeof imgList[0] === 'string' ? imgList[0] : (imgList[0]?.secure_url || imgList[0]?.url || '');
-    const otherImgs = imgList.slice(1).map((img) => (typeof img === 'string' ? img : img?.secure_url || img?.url)).filter(Boolean);
+    // Auto-map attributes strictly from the selected central product (never substitute another product's image or stock photo)
+    const { mainImage: mainImg, otherImages: otherImgs } = selectProductImages(prod);
 
     // Product Type: prioritize master product definition; never default to SHIRT
     const existingType = (prod.productType || '').trim().toUpperCase();
     setSelectedProductType(existingType);
+    if (!existingType) {
+      setSchemaData(null);
+    }
 
     // Bullet points: prioritize master product bulletPoints
     const existingBullets = Array.isArray(prod.bulletPoints) && prod.bulletPoints.filter(Boolean).length > 0
@@ -397,9 +440,15 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
   }, [targetProductId, products.length]);
 
   const handleValidate = async () => {
+    const fingerprintAtRequest = JSON.stringify({
+      productId: selectedProduct?._id || '',
+      productType: selectedProductType,
+      formData,
+    });
     try {
       setValidating(true);
       setErrorMessage(null);
+      setSuccessMessage(null);
 
       const payload = {
         productId: selectedProduct?._id,
@@ -410,14 +459,28 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
         gtinExemptionRequested: formData.gtinExemptionRequested,
       };
 
-      const res = await validateAmazonListingApi(payload);
-      setValidationResult(res);
+      const rawRes = await validateAmazonListingApi(payload);
+      const normalized = normalizeListingValidationResponse(rawRes, schemaData);
+      setValidationResult(normalized);
+      setValidatedFingerprint(fingerprintAtRequest);
 
-      if (res.valid) {
+      const badge = resolveSchemaValidationBadge(normalized.schemaSource);
+
+      if (normalized.valid) {
         if (mainImageState === 'broken') {
-          setSuccessMessage('Listing attributes are valid according to SP-API schema. Notice: Main image could not be loaded in browser — please verify or replace image URL before submission.');
+          setSuccessMessage(
+            badge.isOfficial
+              ? 'Listing attributes passed official Amazon schema validation. Notice: Main image could not be loaded in browser — verify or replace the image URL before submission.'
+              : 'Listing attributes passed local development fallback validation (not official Amazon schema). Notice: Main image could not be loaded in browser — verify or replace the image URL before submission.'
+          );
+        } else if (badge.isOfficial) {
+          setSuccessMessage(
+            'Listing validation passed against the official Amazon Product Type Definitions API v2020-09-01 schema.'
+          );
         } else {
-          setSuccessMessage('Listing validation passed! All required attributes and image formats comply with Amazon specifications.');
+          setSuccessMessage(
+            'Listing passed local development fallback validation. Note: This uses a local fallback schema, not official Amazon SP-API schema verification.'
+          );
         }
         // Also draft-save the submission safely
         try {
@@ -434,10 +497,24 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
           console.warn('Draft save notice:', saveErr);
         }
       } else {
-        setErrorMessage('Listing validation found issues that must be corrected before submission.');
+        setErrorMessage(
+          `Listing validation found ${normalized.errors.length} blocking ${normalized.errors.length === 1 ? 'issue' : 'issues'} that must be corrected before submission.`
+        );
       }
-      return res.valid;
+      return normalized.valid;
     } catch (err) {
+      const normalizedErr = normalizeListingValidationResponse(
+        {
+          success: false,
+          valid: false,
+          code: err.code || 'VALIDATION_REQUEST_FAILED',
+          message: err.message || 'Validation request failed',
+          schemaSource: 'INTERNAL_VALIDATION',
+        },
+        null
+      );
+      setValidationResult(normalizedErr);
+      setValidatedFingerprint(fingerprintAtRequest);
       setErrorMessage(err.message || 'Validation request failed');
       return false;
     } finally {
@@ -600,11 +677,12 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                 <button
                   key={s.step}
                   onClick={() => {
+                    if (s.step === 7 && !canProceedToSubmission) return;
                     if (s.step === 1 || selectedProduct) {
                       setWizardStep(s.step);
                     }
                   }}
-                  disabled={!selectedProduct && s.step > 1}
+                  disabled={(!selectedProduct && s.step > 1) || (s.step === 7 && !canProceedToSubmission)}
                   className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap ${
                     wizardStep === s.step
                       ? 'bg-amber-500 text-white shadow-xs'
@@ -669,10 +747,7 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {(Array.isArray(products) ? products : []).map((prod) => {
-                      const rawImg = typeof prod.images?.[0] === 'string'
-                        ? prod.images[0]
-                        : (prod.images?.[0]?.url || null);
-                      const img = rawImg;
+                      const { mainImage: img } = selectProductImages(prod);
                       const isSelected = selectedProduct?._id === prod._id;
                       const prodTitle = prod.title || prod.name || 'Untitled Product';
                       const prodCategory = prod.categoryName || prod.category || '';
@@ -1100,47 +1175,63 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                   </div>
 
                   {/* Main Image Preview & Real-Time Verification */}
-                  {formData.mainImage ? (
+                  {formData.mainImage && formData.mainImage.trim() ? (
                     <div
                       className={`p-3.5 rounded-xl border flex items-center gap-4 transition-colors ${
                         mainImageState === 'valid'
-                          ? 'bg-emerald-50/50 border-emerald-200'
-                          : mainImageState === 'broken'
+                          ? mainImageInspection.isLocalUpload
+                            ? 'bg-amber-50/50 border-amber-200'
+                            : 'bg-emerald-50/50 border-emerald-200'
+                          : mainImageState === 'broken' || !mainImageInspection.displayable
                           ? 'bg-rose-50/50 border-rose-200'
                           : 'bg-slate-50 border-slate-200'
                       }`}
                     >
-                      <div className="w-20 h-20 rounded-lg border border-slate-200 bg-white flex items-center justify-center overflow-hidden shrink-0">
+                      <div className="w-20 h-20 rounded-lg border border-slate-200 bg-slate-100 flex items-center justify-center overflow-hidden shrink-0">
                         {mainImageState === 'checking' ? (
                           <div className="text-center p-1">
                             <RefreshCw className="w-5 h-5 animate-spin text-amber-500 mx-auto mb-1" />
                             <span className="text-[9px] text-slate-400 block">Testing...</span>
                           </div>
-                        ) : mainImageState === 'broken' ? (
-                          <div className="text-center p-2">
-                            <ImageOff className="w-6 h-6 text-rose-500 mx-auto mb-1" />
-                            <span className="text-[9px] text-rose-600 font-bold block leading-tight">Broken</span>
+                        ) : mainImageState === 'broken' || !mainImageInspection.displayable || !mainImageInspection.resolvedUrl ? (
+                          <div className="text-center p-2" role="img" aria-label="Product image unavailable placeholder">
+                            <ImageOff className="w-6 h-6 text-slate-400 mx-auto mb-1" />
+                            <span className="text-[9px] text-slate-500 font-semibold block leading-tight">Invalid Image</span>
                           </div>
                         ) : (
                           <img
-                            src={resolveProductImageUrl(formData.mainImage)}
-                            alt="Main Preview"
-                            className="w-full h-full object-contain"
+                            src={mainImageInspection.resolvedUrl}
+                            alt={formData.title || 'Selected product image'}
+                            onError={() => {
+                              setMainImageState('broken');
+                              setMainImageError('Image failed to load in browser. The URL may be inaccessible, hotlink-protected, or returning a 404/403 error.');
+                            }}
+                            className="w-full h-full object-contain bg-white"
                           />
                         )}
                       </div>
 
                       <div className="text-xs space-y-1 min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-bold text-slate-800">Main Image Status:</span>
                           {mainImageState === 'valid' && (
                             <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-100/70 px-2 py-0.5 rounded flex items-center gap-1">
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Accessible & Decoded (HTTP 200)
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Loaded in Browser
                             </span>
                           )}
-                          {mainImageState === 'broken' && (
+                          {mainImageInspection.isCloudinary && (
+                            <span className="text-[10px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded">
+                              Cloudinary HTTPS
+                            </span>
+                          )}
+                          {mainImageInspection.isLocalUpload && (
+                            <span className="text-[10px] font-semibold text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded">
+                              Local Upload (Not Public HTTPS for Amazon)
+                            </span>
+                          )}
+                          {(mainImageState === 'broken' || !mainImageInspection.displayable) && (
                             <span className="text-[11px] font-semibold text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded flex items-center gap-1">
-                              <AlertTriangle className="w-3.5 h-3.5 text-rose-600" /> Inaccessible / Broken Link
+                              <AlertTriangle className="w-3.5 h-3.5 text-rose-600" /> Invalid / Inaccessible Link
                             </span>
                           )}
                           {mainImageState === 'checking' && (
@@ -1150,20 +1241,38 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                           )}
                         </div>
 
-                        <span className="text-[10px] text-slate-500 font-mono block truncate max-w-md">
+                        <span className="text-[10px] text-slate-500 font-mono block truncate max-w-md" title={formData.mainImage}>
                           {formData.mainImage}
                         </span>
 
-                        {mainImageState === 'broken' && (
+                        {mainImageInspection.isLocalUpload && (
+                          <p className="text-[11px] text-amber-800 mt-1 leading-snug">
+                            {mainImageInspection.reason}
+                          </p>
+                        )}
+
+                        {(mainImageState === 'broken' || !mainImageInspection.displayable) && (
                           <p className="text-[11px] text-rose-600 mt-1 leading-snug">
-                            {mainImageError || 'The image could not be loaded by the browser. Please paste a live, publicly accessible Cloudinary or image link.'}
+                            {mainImageError || mainImageInspection.reason || 'The image could not be loaded by the browser. Please paste a live, publicly accessible Cloudinary or HTTPS image link.'}
                           </p>
                         )}
                       </div>
                     </div>
                   ) : (
-                    <div className="p-4 border-2 border-dashed border-amber-200 bg-amber-50/50 rounded-xl text-center text-xs text-amber-700">
-                      Main image URL is missing. Please provide a valid HTTPS URL or select a product with image assets.
+                    <div className="p-4 border-2 border-dashed border-slate-200 bg-slate-50 rounded-xl flex items-center gap-4 text-xs text-slate-600">
+                      <div
+                        className="w-16 h-16 rounded-lg border border-slate-200 bg-slate-100 flex items-center justify-center shrink-0 text-slate-400"
+                        role="img"
+                        aria-label="No product image placeholder"
+                      >
+                        <Package className="w-7 h-7" />
+                      </div>
+                      <div>
+                        <div className="font-semibold text-slate-700">No product image configured</div>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          This product does not have a verified main image URL. Provide a public HTTPS image URL (e.g., Cloudinary) before submitting to Amazon.
+                        </p>
+                      </div>
                     </div>
                   )}
 
@@ -1172,31 +1281,45 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                     <label className="block text-xs font-semibold text-slate-700 mb-1">
                       Additional Images (Optional, up to 4)
                     </label>
-                    {formData.otherImages.map((imgUrl, i) => (
-                      <div key={i} className="flex items-center gap-2 mb-2">
-                        <input
-                          type="url"
-                          value={imgUrl}
-                          onChange={(e) => {
-                            const next = [...formData.otherImages];
-                            next[i] = e.target.value;
-                            setFormData({ ...formData, otherImages: next });
-                          }}
-                          placeholder="https://..."
-                          className="flex-1 text-xs border border-slate-200 rounded-lg p-2"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const next = formData.otherImages.filter((_, idx) => idx !== i);
-                            setFormData({ ...formData, otherImages: next });
-                          }}
-                          className="p-1.5 text-slate-400 hover:text-rose-600 rounded"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    ))}
+                    {formData.otherImages.map((imgUrl, i) => {
+                      const otherInspect = inspectListingImageUrl(imgUrl, ASSET_BASE_URL);
+                      return (
+                        <div key={i} className="mb-2 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <ProductThumbnail
+                              src={imgUrl}
+                              alt={`Additional image ${i + 1}`}
+                              className="w-8 h-8 rounded border border-slate-200 shrink-0"
+                              iconClassName="w-4 h-4 text-slate-400"
+                            />
+                            <input
+                              type="url"
+                              value={imgUrl}
+                              onChange={(e) => {
+                                const next = [...formData.otherImages];
+                                next[i] = e.target.value;
+                                setFormData({ ...formData, otherImages: next });
+                              }}
+                              placeholder="https://..."
+                              className="flex-1 text-xs border border-slate-200 rounded-lg p-2"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const next = formData.otherImages.filter((_, idx) => idx !== i);
+                                setFormData({ ...formData, otherImages: next });
+                              }}
+                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                          {imgUrl && !otherInspect.amazonEligible && otherInspect.reason && (
+                            <p className="text-[10px] text-amber-700 pl-10">{otherInspect.reason}</p>
+                          )}
+                        </div>
+                      );
+                    })}
                     {formData.otherImages.length < 4 && (
                       <button
                         type="button"
@@ -1323,60 +1446,152 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
             )}
 
             {/* STEP 6: VALIDATION & PREVIEW */}
-            {wizardStep === 6 && (
+            {wizardStep === 6 && (() => {
+              const effectiveSchemaSource =
+                validationResult?.schemaSource || schemaData?.schemaSource || 'INTERNAL_VALIDATION';
+              const schemaBadge = resolveSchemaValidationBadge(effectiveSchemaSource);
+              const blockingErrors = Array.isArray(validationResult?.errors) ? validationResult.errors : [];
+              const validationWarnings = Array.isArray(validationResult?.warnings) ? validationResult.warnings : [];
+
+              return (
               <div className="space-y-5 max-w-3xl mx-auto">
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="text-sm font-bold text-slate-800">Listing Validation & Final Preview</h3>
                     <p className="text-xs text-slate-500">
-                      Verify all attributes against the official Amazon SP-API Listings Items specification before submission.
+                      Review all attribute validation results and schema provenance before proceeding.
                     </p>
                   </div>
                   <button
                     onClick={handleValidate}
                     disabled={validating}
-                    className="p-1.5 text-xs border border-slate-200 rounded-lg hover:bg-slate-50 flex items-center gap-1 font-semibold text-slate-700"
+                    className="p-1.5 text-xs border border-slate-200 rounded-lg hover:bg-slate-50 flex items-center gap-1 font-semibold text-slate-700 disabled:opacity-50"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${validating ? 'animate-spin' : ''}`} /> Re-Validate
                   </button>
                 </div>
 
+                {/* Stale Validation Warning */}
+                {isValidationStale && (
+                  <div className="p-3 rounded-xl border border-amber-200 bg-amber-50 text-amber-900 text-xs flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        Listing attributes changed since the last validation. Click <strong>Re-Validate</strong> to refresh validation results before proceeding.
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 {/* Validation Status Card */}
-                {validationResult && (
+                {!validationResult ? (
+                  <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 text-slate-700 text-xs flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <Info className="w-4 h-4 text-slate-500 shrink-0" />
+                      <span>Validation has not been executed yet. Click <strong>Re-Validate</strong> to validate all listing attributes.</span>
+                    </div>
+                  </div>
+                ) : (
                   <div
                     className={`p-4 rounded-xl border ${
                       validationResult.valid
-                        ? 'bg-emerald-50/60 border-emerald-200 text-emerald-900'
+                        ? schemaBadge.isOfficial
+                          ? 'bg-emerald-50/60 border-emerald-200 text-emerald-900'
+                          : 'bg-amber-50/70 border-amber-200 text-amber-900'
                         : 'bg-rose-50/60 border-rose-200 text-rose-900'
                     }`}
                   >
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-start gap-2.5">
                       {validationResult.valid ? (
-                        <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                        schemaBadge.isOfficial ? (
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                        )
                       ) : (
-                        <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+                        <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
                       )}
-                      <div>
-                        <h4 className="text-xs font-bold">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h4 className="text-xs font-bold">
+                            {validationResult.valid
+                              ? schemaBadge.isOfficial
+                                ? 'Listing Passed Official Amazon Schema Validation'
+                                : 'Listing Passed Local Development Fallback Validation'
+                              : `Listing Payload Has Validation Errors (${blockingErrors.length})`}
+                          </h4>
+                          <span
+                            className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                              schemaBadge.isOfficial
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : schemaBadge.tone === 'fallback'
+                                ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                                : 'bg-slate-200 text-slate-700'
+                            }`}
+                          >
+                            {schemaBadge.badgeText}
+                          </span>
+                        </div>
+                        <p className="text-[11px] opacity-90 mt-0.5">
                           {validationResult.valid
-                            ? 'Listing Payload Passed Local Schema Validation'
-                            : 'Listing Payload Has Validation Errors'}
-                        </h4>
-                        <p className="text-[11px] opacity-90">
-                          {validationResult.valid
-                            ? 'All required attributes and format requirements comply with SP-API v2021-08-01.'
-                            : 'Please resolve the following issues before submitting.'}
+                            ? schemaBadge.isOfficial
+                              ? 'All required attributes comply with the official Amazon SP-API Product Type schema.'
+                              : 'All checked attributes passed local internal and development fallback rules. Official Amazon SP-API schema verification is not available in India Sandbox.'
+                            : 'Resolve every blocking error listed below and click Re-Validate to enable submission.'}
                         </p>
                       </div>
                     </div>
 
-                    {Array.isArray(validationResult.issues) && validationResult.issues.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-rose-200/60 space-y-1">
-                        {validationResult.issues.map((iss, i) => (
-                          <div key={i} className="text-xs flex items-center gap-1.5 text-rose-700">
-                            <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
-                            <span className="font-semibold font-mono text-[11px]">{iss.attribute}:</span>
-                            <span>{iss.message}</span>
+                    {/* Blocking Validation Errors */}
+                    {blockingErrors.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-rose-200/70 space-y-2" role="list" aria-label="Validation errors">
+                        {blockingErrors.map((err, i) => (
+                          <div
+                            key={`${err.attributeName || err.attribute}-${err.code}-${i}`}
+                            role="listitem"
+                            className="p-2.5 bg-white/90 border border-rose-200 rounded-lg text-xs text-rose-900 space-y-1"
+                          >
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0"></span>
+                                <span className="font-bold text-rose-800">{err.attributeLabel || err.attribute}</span>
+                                <code className="text-[10px] font-mono bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded">
+                                  {err.attributeName || err.attribute}
+                                </code>
+                                {err.code && (
+                                  <code className="text-[10px] font-mono bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">
+                                    {err.code}
+                                  </code>
+                                )}
+                              </div>
+                              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                                {formatValidationSourceLabel(err.source)}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-rose-700 pl-3">{err.message}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Non-Blocking Validation Warnings */}
+                    {validationWarnings.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-amber-200/70 space-y-1.5" role="list" aria-label="Validation warnings">
+                        <div className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                          Recommendations / Non-Blocking Warnings ({validationWarnings.length})
+                        </div>
+                        {validationWarnings.map((warn, i) => (
+                          <div
+                            key={`${warn.attributeName || warn.attribute}-${warn.code}-${i}`}
+                            role="listitem"
+                            className="p-2 bg-amber-50/90 border border-amber-200 rounded-lg text-[11px] text-amber-900 flex items-start gap-1.5"
+                          >
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                            <div>
+                              <span className="font-bold">{warn.attributeLabel || warn.attribute}</span>{' '}
+                              <code className="text-[10px] font-mono text-amber-700">({warn.attributeName || warn.attribute})</code>:{' '}
+                              <span>{warn.message}</span>
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -1390,52 +1605,66 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                     <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
                       Amazon Listing Mockup Preview
                     </span>
-                    {mainImageState === 'broken' && (
+                    {(mainImageState === 'broken' || (formData.mainImage && !mainImageInspection.displayable)) && (
                       <span className="text-[10px] text-rose-600 font-semibold bg-rose-50 px-2 py-0.5 rounded border border-rose-200 flex items-center gap-1">
-                        <AlertTriangle className="w-3 h-3" /> Image Inaccessible in Step 4
+                        <AlertTriangle className="w-3 h-3" /> Image Invalid / Inaccessible in Step 4
                       </span>
                     )}
-                    {mainImageState === 'valid' && (
+                    {mainImageState === 'valid' && mainImageInspection.displayable && (
                       <span className="text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 flex items-center gap-1">
                         <CheckCircle2 className="w-3 h-3 text-emerald-600" /> Image Loaded & Verified
                       </span>
                     )}
                   </div>
 
-                  {schemaData?.schemaSource === 'DEVELOPMENT_FALLBACK' ? (
-                    <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600 flex items-start gap-2">
-                      <Info className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
-                      <div>
-                        <span className="font-semibold text-slate-700">Schema Validation Source:</span> Validated against high-fidelity local schema definition (Amazon SP-API Sandbox Definitions API unavailable for India). This verifies mandatory attributes, syntax, and payload structure according to SP-API v2021-08-01 specifications, but is not an official Amazon grant.
-                      </div>
-                    </div>
-                  ) : (
+                  {/* Honest Schema Validation Source Banner (Green ONLY for official AMAZON_SP_API) */}
+                  {schemaBadge.isOfficial ? (
                     <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-800 flex items-start gap-2">
                       <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                       <div>
-                        <span className="font-semibold text-emerald-900">Official Schema Verification:</span> Validated against official Amazon Product Type Definitions API v2020-09-01.
+                        <span className="font-semibold text-emerald-900">{schemaBadge.title}:</span>{' '}
+                        {validationResult?.schemaNote || schemaBadge.description}
+                      </div>
+                    </div>
+                  ) : schemaBadge.tone === 'fallback' ? (
+                    <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-semibold text-amber-950">{schemaBadge.title}:</span>{' '}
+                        {validationResult?.schemaNote || schemaBadge.description}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-700 flex items-start gap-2">
+                      <Info className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-semibold text-slate-800">{schemaBadge.title}:</span>{' '}
+                        {validationResult?.schemaNote || schemaBadge.description}
                       </div>
                     </div>
                   )}
 
                   <div className="flex gap-4">
-                    <div className="w-24 h-24 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-center shrink-0 overflow-hidden">
+                    <div className="w-24 h-24 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center shrink-0 overflow-hidden">
                       {mainImageState === 'checking' ? (
                         <RefreshCw className="w-6 h-6 animate-spin text-amber-500" />
-                      ) : mainImageState === 'broken' ? (
-                        <div className="text-center p-2">
-                          <ImageOff className="w-6 h-6 text-rose-400 mx-auto mb-1" />
-                          <span className="text-[9px] text-rose-600 font-bold block leading-tight">Image Inaccessible</span>
+                      ) : !formData.mainImage || !formData.mainImage.trim() ? (
+                        <div className="text-center p-2" role="img" aria-label="No product image placeholder">
+                          <Package className="w-7 h-7 text-slate-400 mx-auto mb-1" />
+                          <span className="text-[9px] text-slate-500 font-semibold block leading-tight">No Image</span>
                         </div>
-                      ) : formData.mainImage ? (
+                      ) : mainImageState === 'broken' || !mainImageInspection.displayable || !mainImageInspection.resolvedUrl ? (
+                        <div className="text-center p-2" role="img" aria-label="Invalid product image placeholder">
+                          <ImageOff className="w-6 h-6 text-slate-400 mx-auto mb-1" />
+                          <span className="text-[9px] text-slate-500 font-semibold block leading-tight">Image Unavailable</span>
+                        </div>
+                      ) : (
                         <img
-                          src={resolveProductImageUrl(formData.mainImage)}
-                          alt="Preview"
-                          className="w-full h-full object-contain"
+                          src={mainImageInspection.resolvedUrl}
+                          alt={formData.title || 'Selected product preview'}
+                          className="w-full h-full object-contain bg-white"
                           onError={() => setMainImageState('broken')}
                         />
-                      ) : (
-                        <Package className="w-8 h-8 text-slate-400" />
                       )}
                     </div>
 
@@ -1484,7 +1713,7 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                     <div className="p-3 bg-slate-900 text-slate-100 text-[11px] font-mono overflow-x-auto max-h-64">
                       <pre>
                         {JSON.stringify(
-                          {
+                          validationResult?.payloadPreview || {
                             productType: selectedProductType,
                             requirements: 'LISTING',
                             attributes: {
@@ -1505,7 +1734,7 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                               }],
                               country_of_origin: [{ value: formData.countryOfOrigin, marketplace_id: 'A21TJRUUN4KGV' }],
                               ...(!formData.gtinExemptionRequested && formData.externalProductId ? {
-                                extern_id: [{ type: formData.externalProductIdType, value: formData.externalProductId, marketplace_id: 'A21TJRUUN4KGV' }]
+                                standard_product_id: [{ type: formData.externalProductIdType, value: formData.externalProductId, marketplace_id: 'A21TJRUUN4KGV' }]
                               } : {})
                             }
                           },
@@ -1525,15 +1754,19 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                     <ArrowLeft className="w-3.5 h-3.5" /> Back
                   </button>
                   <button
-                    onClick={() => setWizardStep(7)}
-                    disabled={validationResult && !validationResult.valid}
-                    className="bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50"
+                    onClick={() => {
+                      if (!canProceedToSubmission) return;
+                      setWizardStep(7);
+                    }}
+                    disabled={!canProceedToSubmission}
+                    className="bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Proceed to Submission <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </div>
-            )}
+              );
+            })()}
 
             {/* STEP 7: SUBMISSION / DRY-RUN */}
             {wizardStep === 7 && (

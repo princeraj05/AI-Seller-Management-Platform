@@ -73,6 +73,7 @@ import { MarketplaceListingSubmission } from './marketplaceListingSubmission.mod
 import {
   searchProductTypes,
   getProductTypeDefinition,
+  validatePayloadAgainstProductTypeSchema,
 } from '../../integrations/marketplaces/amazon/amazon.definitions.service.js';
 import {
   validateListingData,
@@ -1266,7 +1267,13 @@ export const sanitizeEligibleProduct = (prod) => {
     color: doc.color || '',
     attributes: attributesObj,
     images: Array.isArray(doc.images)
-      ? doc.images.map((img) => (img && typeof img === 'object' && img.url ? img.url : img)).filter(Boolean)
+      ? doc.images
+          .map((img) => {
+            if (typeof img === 'string') return img.trim();
+            if (img && typeof img === 'object') return String(img.secure_url || img.url || '').trim();
+            return '';
+          })
+          .filter(Boolean)
       : [],
     masterPrice: doc.masterPrice !== undefined ? Number(doc.masterPrice) : Number(doc.price || 0),
     stock: doc.stock !== undefined ? Number(doc.stock) : 0,
@@ -1449,16 +1456,47 @@ export const validateAmazonListing = async (req, res) => {
     const { productId, mappedAttributes, productType, gtinExemption, gtinExemptionRequested, sellerSku } = req.body;
 
     if (!productId) {
-      return errorResponse(res, 400, 'productId is required for listing validation');
+      const missingProductIssue = {
+        code: 'MISSING_PRODUCT_ID',
+        severity: 'ERROR',
+        attribute: 'productId',
+        attributeName: 'productId',
+        source: 'INTERNAL_VALIDATION',
+        message: 'productId is required for listing validation.',
+      };
+      return res.status(400).json({
+        success: false,
+        message: 'productId is required for listing validation',
+        code: 'MISSING_PRODUCT_ID',
+        valid: false,
+        schemaSource: 'INTERNAL_VALIDATION',
+        validationSource: 'INTERNAL_VALIDATION',
+        issues: [missingProductIssue],
+        errors: [missingProductIssue],
+        warnings: [],
+      });
     }
 
     if (!productType || !productType.trim()) {
-      return errorResponse(
-        res,
-        400,
-        'Amazon Product Type is required. Please select a valid product type definition.',
-        'MISSING_PRODUCT_TYPE'
-      );
+      const missingTypeIssue = {
+        code: 'MISSING_PRODUCT_TYPE',
+        severity: 'ERROR',
+        attribute: 'productType',
+        attributeName: 'productType',
+        source: 'INTERNAL_VALIDATION',
+        message: 'Amazon Product Type is required. Please select a valid product type definition in Step 2.',
+      };
+      return res.status(400).json({
+        success: false,
+        message: 'Amazon Product Type is required. Please select a valid product type definition.',
+        code: 'MISSING_PRODUCT_TYPE',
+        valid: false,
+        schemaSource: 'INTERNAL_VALIDATION',
+        validationSource: 'INTERNAL_VALIDATION',
+        issues: [missingTypeIssue],
+        errors: [missingTypeIssue],
+        warnings: [],
+      });
     }
     const cleanProductType = productType.trim().toUpperCase();
 
@@ -1473,14 +1511,42 @@ export const validateAmazonListing = async (req, res) => {
     try {
       product = await Product.findOne(productQuery).lean();
     } catch (e) {
-      // fallback
+      // fallback in non-production
+    }
+
+    if (!product && !isProductionEnv() && inMemoryProductsMap.has(String(productId))) {
+      const candidate = inMemoryProductsMap.get(String(productId));
+      const matchesSeller = !sellerId || String(candidate?.sellerId || candidate?.seller) === String(sellerId);
+      const candStore = candidate?.storeId ? String(candidate.storeId) : null;
+      if (matchesSeller && candStore === storeId) {
+        product = candidate;
+      }
     }
 
     if (!product) {
-      return errorResponse(res, 404, 'Master product not found in catalogue');
+      const notFoundIssue = {
+        code: 'PRODUCT_NOT_FOUND',
+        severity: 'ERROR',
+        attribute: 'productId',
+        attributeName: 'productId',
+        source: 'INTERNAL_VALIDATION',
+        message: 'Master product not found in catalogue for this seller account.',
+      };
+      return res.status(404).json({
+        success: false,
+        message: 'Master product not found in catalogue',
+        code: 'PRODUCT_NOT_FOUND',
+        valid: false,
+        schemaSource: 'INTERNAL_VALIDATION',
+        validationSource: 'INTERNAL_VALIDATION',
+        issues: [notFoundIssue],
+        errors: [notFoundIssue],
+        warnings: [],
+      });
     }
 
     const isExempt = Boolean(gtinExemption ?? gtinExemptionRequested ?? mappedAttributes?.gtinExemptionRequested);
+    const resolvedMarketplaceId = req.body.marketplaceId || 'A21TJRUUN4KGV';
 
     const validation = validateListingData({
       product,
@@ -1493,16 +1559,94 @@ export const validateAmazonListing = async (req, res) => {
       product,
       mappedAttributes: mappedAttributes || {},
       productType: cleanProductType,
-      marketplaceId: req.body.marketplaceId || 'A21TJRUUN4KGV',
+      marketplaceId: resolvedMarketplaceId,
       sellerSku: sellerSku || product.sku,
       gtinExemption: isExempt,
     });
 
+    // Retrieve Product Type schema (official Amazon SP-API if available, otherwise transparently labeled DEVELOPMENT_FALLBACK)
+    let schemaDef = null;
+    try {
+      let client = null;
+      try {
+        const tenantClient = await getAmazonClientForTenant(req.tenant);
+        client = tenantClient.client;
+      } catch {
+        client = null;
+      }
+      schemaDef = await getProductTypeDefinition(client, cleanProductType, {
+        marketplaceId: resolvedMarketplaceId,
+      });
+    } catch {
+      schemaDef = null;
+    }
+
+    const schemaSource = schemaDef?.schemaSource || 'INTERNAL_VALIDATION';
+    const validationSource =
+      schemaSource === 'AMAZON_SP_API'
+        ? 'OFFICIAL_AMAZON_SCHEMA'
+        : schemaSource === 'DEVELOPMENT_FALLBACK'
+        ? 'DEVELOPMENT_FALLBACK_SCHEMA'
+        : 'INTERNAL_VALIDATION';
+
+    const schemaValidation = schemaDef
+      ? validatePayloadAgainstProductTypeSchema(payloadPreview, schemaDef)
+      : { valid: true, errors: [], warnings: [], schemaSource: 'INTERNAL_VALIDATION' };
+
+    const taggedInternalIssues = (validation.issues || []).map((iss) => ({
+      ...iss,
+      attribute: iss.attribute || iss.attributeName || 'general',
+      attributeName: iss.attributeName || iss.attribute || 'general',
+      severity: iss.severity || 'ERROR',
+      source: 'INTERNAL_VALIDATION',
+    }));
+
+    const taggedSchemaIssues = [
+      ...(schemaValidation.errors || []).map((err) => ({
+        ...err,
+        attribute: err.attribute || 'schema',
+        attributeName: err.attribute || 'schema',
+        severity: 'ERROR',
+        source: validationSource,
+      })),
+      ...(schemaValidation.warnings || []).map((warn) => ({
+        ...warn,
+        attribute: warn.attribute || 'schema',
+        attributeName: warn.attribute || 'schema',
+        severity: 'WARNING',
+        source: validationSource,
+      })),
+    ];
+
+    // Merge issues while avoiding duplicate required-field errors already reported by internal validation
+    const seenKeys = new Set();
+    const mergedIssues = [];
+    for (const item of [...taggedInternalIssues, ...taggedSchemaIssues]) {
+      const key = `${item.severity}:${item.attributeName || item.attribute}:${item.code || item.message}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        mergedIssues.push(item);
+      }
+    }
+
+    const mergedErrors = mergedIssues.filter((i) => i.severity === 'ERROR');
+    const mergedWarnings = mergedIssues.filter((i) => i.severity === 'WARNING');
+    const isValid = mergedErrors.length === 0;
+
     return successResponse(res, 200, 'Listing attributes validated', {
-      valid: validation.valid,
-      issues: validation.issues,
-      errors: validation.errors,
-      warnings: validation.warnings,
+      valid: isValid,
+      issues: mergedIssues,
+      errors: mergedErrors,
+      warnings: mergedWarnings,
+      schemaSource,
+      validationSource,
+      schemaNote:
+        schemaSource === 'AMAZON_SP_API'
+          ? 'Validated against official Amazon Product Type Definitions API v2020-09-01.'
+          : schemaSource === 'DEVELOPMENT_FALLBACK'
+          ? schemaDef?.note ||
+            'Validated using internal rules and a local development fallback schema (Amazon Sandbox Definitions API does not provide dynamic India schemas). This is not an official Amazon SP-API schema verification.'
+          : 'Validated using internal attribute checks only. Official Amazon schema was not evaluated.',
       payloadPreview,
     });
   } catch (error) {
