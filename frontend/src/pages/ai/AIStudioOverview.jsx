@@ -23,8 +23,12 @@ import {
   Copy,
   Camera,
   Layers,
+  Sliders,
+  Globe,
+  Plus,
+  Trash2,
 } from 'lucide-react';
-import { generateProductAIApi, analyzeProductImageApi } from '../../services/aiService';
+import { generateProductAIApi, analyzeProductImageApi, generateListingDraftApi } from '../../services/aiService';
 import { createProductApi } from '../../services/productService';
 import { getAiInsightsApi, askAiAssistantApi } from '../../services/aiIntelligenceService';
 
@@ -76,6 +80,52 @@ export default function AIStudioOverview() {
   const [visionMultipleProducts, setVisionMultipleProducts] = useState(false);
   const [visionImageMeta, setVisionImageMeta] = useState(null);
   const [visionProcessingMeta, setVisionProcessingMeta] = useState(null);
+
+  // ==========================================
+  // PHASE 03.3.4: GROUNDED LISTING ORCHESTRATION & DRAFT STATE
+  // ==========================================
+  const [rawVisionData, setRawVisionData] = useState(null); // Intact original vision response for restart fallback
+  const [focalProductSelection, setFocalProductSelection] = useState('');
+  const [preferredTitle, setPreferredTitle] = useState('');
+  const [preferredBrand, setPreferredBrand] = useState('');
+  const [sellerAdditionalDetails, setSellerAdditionalDetails] = useState('');
+
+  // Seller Listing Preferences
+  const [listingTone, setListingTone] = useState('artisan');
+  const [listingTargetAudience, setListingTargetAudience] = useState('');
+  const [listingMarketplaceFocus, setListingMarketplaceFocus] = useState('general');
+  const [listingIncludeStylingTips, setListingIncludeStylingTips] = useState(false);
+
+  // Listing Generation Progress & Error States
+  const [isGeneratingListing, setIsGeneratingListing] = useState(false);
+  const [listingError, setListingError] = useState(null);
+  const [generatedDraft, setGeneratedDraft] = useState(null);
+  const [draftMetadata, setDraftMetadata] = useState(null);
+
+  // Step 3: Editable Draft Review States
+  const [listingTitle, setListingTitle] = useState('');
+  const [listingShortDesc, setListingShortDesc] = useState('');
+  const [listingDesc, setListingDesc] = useState('');
+  const [listingProductType, setListingProductType] = useState('');
+  const [listingCategoryPrimary, setListingCategoryPrimary] = useState('');
+  const [listingCategorySub, setListingCategorySub] = useState('');
+  const [listingBrand, setListingBrand] = useState('');
+  const [listingAttributes, setListingAttributes] = useState([]);
+  const [listingBulletPoints, setListingBulletPoints] = useState([]);
+  const [listingKeywords, setListingKeywords] = useState([]);
+  const [newKeywordInput, setNewKeywordInput] = useState('');
+  const [listingSeo, setListingSeo] = useState({ meta_title: '', meta_description: '', slug: '' });
+  const [listingConfirmationFields, setListingConfirmationFields] = useState([]);
+  const [listingValidationWarnings, setListingValidationWarnings] = useState([]);
+  const [listingIsFallback, setListingIsFallback] = useState(false);
+  const [listingAiProvider, setListingAiProvider] = useState('openai');
+
+  // Step 3: Master Product Persistence States
+  const [listingSku, setListingSku] = useState('');
+  const [listingPrice, setListingPrice] = useState('1299');
+  const [listingStock, setListingStock] = useState('50');
+  const [isSavingMasterProduct, setIsSavingMasterProduct] = useState(false);
+  const [masterProductSuccess, setMasterProductSuccess] = useState(null);
 
   // ==========================================
   // LEGACY TAB: AI PRODUCT GENERATOR STATE
@@ -152,6 +202,15 @@ export default function AIStudioOverview() {
     setVisionPreview(URL.createObjectURL(file));
     setVisionToken(null);
     setVisionTokenExpiry(null);
+    setRawVisionData(null);
+    setFocalProductSelection('');
+    setSellerAdditionalDetails('');
+    setPreferredTitle('');
+    setPreferredBrand('');
+    setGeneratedDraft(null);
+    setDraftMetadata(null);
+    setListingError(null);
+    setMasterProductSuccess(null);
   };
 
   const handleRemoveFile = () => {
@@ -164,6 +223,15 @@ export default function AIStudioOverview() {
     setVisionProgress(0);
     setVisionToken(null);
     setVisionTokenExpiry(null);
+    setRawVisionData(null);
+    setFocalProductSelection('');
+    setSellerAdditionalDetails('');
+    setPreferredTitle('');
+    setPreferredBrand('');
+    setGeneratedDraft(null);
+    setDraftMetadata(null);
+    setListingError(null);
+    setMasterProductSuccess(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -174,6 +242,10 @@ export default function AIStudioOverview() {
     setVisionError(null);
     setVisionToken(null);
     setVisionTokenExpiry(null);
+    setRawVisionData(null);
+    setGeneratedDraft(null);
+    setDraftMetadata(null);
+    setListingError(null);
 
     if (!visionFile) {
       setVisionError('Please select or drop a product image to analyze.');
@@ -207,6 +279,7 @@ export default function AIStudioOverview() {
       const expiresAt = res?.data?.expires_at || res?.expires_at || null;
       setVisionToken(token);
       setVisionTokenExpiry(expiresAt);
+      setRawVisionData(v);
 
       setVisionProductType(v.product_type || '');
       setVisionVisualDescription(v.visual_description || '');
@@ -329,6 +402,279 @@ export default function AIStudioOverview() {
         src: {labels[source] || source}
       </span>
     );
+  };
+
+  // ==========================================
+  // PHASE 03.3.4: GROUNDED LISTING ORCHESTRATION HELPERS & HANDLERS
+  // ==========================================
+  const renderListingProvenanceBadge = (provenance, isConfirmationRequired) => {
+    if (isConfirmationRequired) {
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+          <AlertCircle className="w-3 h-3 text-amber-600" />
+          Requires Confirmation
+        </span>
+      );
+    }
+    switch (provenance) {
+      case 'vision_observation':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+            Verified Vision
+          </span>
+        );
+      case 'seller_provided':
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-300">
+            <Tag className="w-3 h-3 text-blue-600" />
+            Seller Provided
+          </span>
+        );
+      case 'vision_inference':
+      default:
+        return (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-800 border border-purple-300">
+            <Sparkles className="w-3 h-3 text-purple-600" />
+            Reasonable Inference
+          </span>
+        );
+    }
+  };
+
+  const buildSellerCorrections = () => {
+    const corrections = {};
+
+    if (preferredTitle.trim()) {
+      corrections.preferred_title = preferredTitle.trim();
+    }
+    if (preferredBrand.trim()) {
+      corrections.preferred_brand = preferredBrand.trim();
+    }
+    if (visionProductType.trim() && visionProductType.trim() !== (rawVisionData?.product_type || '').trim()) {
+      corrections.corrected_product_type = visionProductType.trim();
+    }
+    if (
+      (visionCategory.primary_category && visionCategory.primary_category !== rawVisionData?.category?.primary_category) ||
+      (visionCategory.subcategory && visionCategory.subcategory !== rawVisionData?.category?.subcategory)
+    ) {
+      corrections.corrected_category = {
+        primary_category: (visionCategory.primary_category || '').trim(),
+        subcategory: (visionCategory.subcategory || '').trim(),
+      };
+    }
+    if (sellerAdditionalDetails.trim()) {
+      corrections.additional_details = sellerAdditionalDetails.trim();
+    }
+
+    const overrides = {};
+    if (Array.isArray(visionAttributes)) {
+      visionAttributes.forEach((attr) => {
+        const orig = rawVisionData?.attributes?.find((a) => a.name === attr.name);
+        if (!orig || (orig.value || '').trim() !== (attr.value || '').trim()) {
+          overrides[attr.name] = (attr.value || '').trim();
+        }
+      });
+    }
+    if (Object.keys(overrides).length > 0) {
+      corrections.attribute_overrides = overrides;
+    }
+
+    if (visionMultipleProducts && focalProductSelection.trim()) {
+      corrections.focal_product_selection = focalProductSelection.trim();
+    }
+
+    return Object.keys(corrections).length > 0 ? corrections : null;
+  };
+
+  const handleGenerateListingDraft = async () => {
+    setListingError(null);
+
+    if (!visionToken) {
+      setListingError('No active vision token found. Please re-analyze the product photo.');
+      return;
+    }
+
+    if (isVisionTokenExpired) {
+      setListingError('Vision token has expired. Please re-analyze the product photo to establish a valid cryptographic session.');
+      return;
+    }
+
+    if (visionMultipleProducts && !focalProductSelection.trim()) {
+      setListingError('Multiple products detected in frame. Please specify which product to feature under Focal Product Selection.');
+      return;
+    }
+
+    setIsGeneratingListing(true);
+
+    try {
+      const payload = {
+        vision_token: visionToken,
+        seller_corrections: buildSellerCorrections(),
+        client_vision_data: rawVisionData || null,
+        preferences: {
+          tone: listingTone,
+          target_audience: listingTargetAudience.trim() || undefined,
+          marketplace_focus: listingMarketplaceFocus,
+          include_styling_tips: listingIncludeStylingTips,
+        },
+      };
+
+      const res = await generateListingDraftApi(payload);
+      const draft = res?.data?.draft || res?.draft;
+      const metadata = res?.data?.metadata || res?.metadata;
+      const isFallback = Boolean(res?.data?.isFallback || res?.isFallback || metadata?.is_fallback);
+      const aiProvider = res?.data?.aiProvider || metadata?.ai_provider || (isFallback ? 'fallback' : 'ai');
+
+      if (!draft) {
+        throw new Error('AI backend did not return a valid listing draft.');
+      }
+
+      setGeneratedDraft(draft);
+      setDraftMetadata(metadata);
+
+      // Populate draft review states
+      setListingTitle(draft.title || '');
+      setListingShortDesc(draft.short_description || '');
+      setListingDesc(draft.description || '');
+      setListingProductType(draft.product_type || visionProductType || '');
+      setListingCategoryPrimary(draft.category?.primary_category || visionCategory.primary_category || '');
+      setListingCategorySub(draft.category?.subcategory || visionCategory.subcategory || '');
+      setListingBrand(draft.brand || preferredBrand || 'Bhartiye Crafts');
+      setListingAttributes(Array.isArray(draft.attributes) ? [...draft.attributes] : []);
+      setListingBulletPoints(Array.isArray(draft.bullet_points) ? [...draft.bullet_points] : []);
+      setListingKeywords(Array.isArray(draft.search_keywords) ? [...draft.search_keywords] : []);
+      setListingSeo(draft.seo || { meta_title: '', meta_description: '', slug: '' });
+      setListingConfirmationFields(Array.isArray(draft.fields_requiring_seller_confirmation) ? draft.fields_requiring_seller_confirmation : []);
+      setListingValidationWarnings(Array.isArray(draft.validation_warnings) ? draft.validation_warnings : []);
+      setListingIsFallback(isFallback);
+      setListingAiProvider(aiProvider);
+
+      // Generate suggested SKU
+      const prefix = (draft.brand || 'BC').slice(0, 3).toUpperCase().replace(/[^A-Z]/g, 'BC');
+      const code = Math.floor(100 + Math.random() * 900);
+      setListingSku(`${prefix}-${code}`);
+
+      setVisionStep(3); // Advance to Step 3: Review Generated Listing Draft
+    } catch (err) {
+      if (err.code === 'VISION_TOKEN_EXPIRED' || err.code === 'VISION_RESULT_EXPIRED') {
+        setListingError('Vision analysis token has expired. Please re-analyze the image to establish a valid session.');
+      } else if (err.code === 'FOCAL_PRODUCT_SELECTION_REQUIRED') {
+        setListingError('Multiple products detected. Please provide a focal product selection in seller corrections.');
+      } else {
+        setListingError(err.message || 'Listing generation failed. Please try again.');
+      }
+    } finally {
+      setIsGeneratingListing(false);
+    }
+  };
+
+  const handleUpdateDraftAttribute = (idx, field, val) => {
+    setListingAttributes((prev) => {
+      const updated = [...prev];
+      if (updated[idx]) {
+        updated[idx] = { ...updated[idx], [field]: val };
+      }
+      return updated;
+    });
+  };
+
+  const handleUpdateBulletPoint = (idx, val) => {
+    setListingBulletPoints((prev) => {
+      const updated = [...prev];
+      updated[idx] = val;
+      return updated;
+    });
+  };
+
+  const handleAddBulletPoint = () => {
+    if (listingBulletPoints.length < 6) {
+      setListingBulletPoints((prev) => [...prev, 'High quality handcrafted details suitable for modern living']);
+    }
+  };
+
+  const handleRemoveBulletPoint = (idx) => {
+    if (listingBulletPoints.length > 3) {
+      setListingBulletPoints((prev) => prev.filter((_, i) => i !== idx));
+    }
+  };
+
+  const handleAddKeyword = (e) => {
+    e?.preventDefault();
+    const kw = newKeywordInput.trim().toLowerCase();
+    if (kw && !listingKeywords.includes(kw) && listingKeywords.length < 25) {
+      setListingKeywords((prev) => [...prev, kw]);
+      setNewKeywordInput('');
+    }
+  };
+
+  const handleRemoveKeyword = (kwToRemove) => {
+    if (listingKeywords.length > 3) {
+      setListingKeywords((prev) => prev.filter((k) => k !== kwToRemove));
+    }
+  };
+
+  const handleApproveAndCreateMasterProduct = async () => {
+    setListingError(null);
+
+    if (!listingTitle.trim()) {
+      setListingError('Product Title cannot be empty.');
+      return;
+    }
+    if (!listingSku.trim()) {
+      setListingError('SKU is required.');
+      return;
+    }
+    if (listingPrice === '' || isNaN(Number(listingPrice)) || Number(listingPrice) < 0) {
+      setListingError('Valid master price (>= 0) is required.');
+      return;
+    }
+
+    setIsSavingMasterProduct(true);
+
+    try {
+      const attributeMap = {};
+      if (Array.isArray(listingAttributes)) {
+        listingAttributes.forEach((attr) => {
+          if (attr.name && attr.value) {
+            attributeMap[attr.name] = String(attr.value).trim();
+          }
+        });
+      }
+
+      const payload = {
+        title: listingTitle.trim(),
+        shortDescription: listingShortDesc.trim(),
+        description: listingDesc.trim(),
+        category: listingCategoryPrimary || 'Fashion',
+        categoryName: listingCategoryPrimary || 'Fashion',
+        brand: listingBrand.trim() || 'Bhartiye Crafts',
+        sku: listingSku.trim().toUpperCase(),
+        masterPrice: Number(listingPrice),
+        material: attributeMap.material || attributeMap.wood_type || '',
+        color: attributeMap.primary_color || attributeMap.color || '',
+        stock: Number(listingStock) || 0,
+        attributes: attributeMap,
+        keywords: listingKeywords,
+        tags: ['ai-vision-grounded', ...(listingIsFallback ? ['grounded-fallback'] : ['llm-generated'])],
+        seo: {
+          title: listingSeo?.meta_title || listingTitle.trim(),
+          description: listingSeo?.meta_description || listingShortDesc.trim(),
+          keywords: listingKeywords,
+        },
+        aiGenerated: true,
+        aiApproved: true,
+      };
+
+      const res = await createProductApi(payload);
+      const created = res?.data?.product || res?.product || res?.data || res;
+      setMasterProductSuccess(created);
+      setVisionStep(4);
+    } catch (err) {
+      setListingError(err.message || 'Failed to save master product in catalog.');
+    } finally {
+      setIsSavingMasterProduct(false);
+    }
   };
 
   // ==========================================
@@ -538,14 +884,22 @@ export default function AIStudioOverview() {
       {activeTab === 'AI Vision Studio' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-6 text-xs">
           {/* Workflow Header Steps */}
-          <div className="grid grid-cols-2 gap-3 text-center border-b border-slate-100 pb-4 text-xs font-bold">
-            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-2 ${visionStep === 1 ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
-              <Upload className="w-4 h-4" />
-              <span>1. Upload Product Photo & Pre-flight</span>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 text-center border-b border-slate-100 pb-4 text-xs font-bold">
+            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-1.5 ${visionStep === 1 ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
+              <Upload className="w-4 h-4 flex-shrink-0" />
+              <span className="truncate">1. Upload & Pre-flight</span>
             </div>
-            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-2 ${visionStep === 2 ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
-              <Eye className="w-4 h-4" />
-              <span>2. Review & Edit Vision Intelligence</span>
+            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-1.5 ${visionStep === 2 ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
+              <Eye className="w-4 h-4 flex-shrink-0" />
+              <span className="truncate">2. Evidence & Corrections</span>
+            </div>
+            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-1.5 ${visionStep === 3 ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
+              <Sparkles className="w-4 h-4 flex-shrink-0" />
+              <span className="truncate">3. Grounded Listing Draft</span>
+            </div>
+            <div className={`p-2.5 rounded-xl flex items-center justify-center gap-1.5 ${visionStep === 4 ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500'}`}>
+              <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+              <span className="truncate">4. Master Product Created</span>
             </div>
           </div>
 
@@ -1068,20 +1422,667 @@ export default function AIStudioOverview() {
                     )}
                   </div>
 
-                  {/* Scoping Notice */}
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-[11px] text-slate-500 flex items-center justify-between">
-                    <span>
-                      <strong>Phase 03.2 Scope:</strong> Vision extraction and review only. Product catalog persistence and marketplace publishing will be enabled in subsequent integration phases.
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setVisionStep(1)}
-                      className="px-3 py-1 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors"
-                    >
-                      New Photo
-                    </button>
+                  {/* Focal Product Disambiguation (if multiple items detected) */}
+                  {visionMultipleProducts && (
+                    <div className="p-4 border-2 border-amber-300 bg-amber-50 rounded-xl space-y-2">
+                      <div className="flex items-center gap-2 text-amber-900 font-bold">
+                        <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                        <span>Focal Product Selection (Required)</span>
+                      </div>
+                      <p className="text-[11px] text-amber-800">
+                        The vision engine detected multiple products in this photograph. Specify which item is the primary focal product to anchor the listing generation.
+                      </p>
+                      <input
+                        type="text"
+                        placeholder="e.g. Center brass peacock diya, front ceramic mug, wooden bowl on left"
+                        value={focalProductSelection}
+                        onChange={(e) => setFocalProductSelection(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-amber-300 rounded-lg text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                      />
+                    </div>
+                  )}
+
+                  {/* Seller Context & Grounding Additions */}
+                  <div className="p-4 border border-slate-200 rounded-xl space-y-3 bg-white">
+                    <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+                      <Tag className="w-4 h-4 text-blue-600" />
+                      <h4 className="font-bold text-sm text-slate-900">
+                        Seller Context & Preferred Details (Optional)
+                      </h4>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Preferred Title
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. Handcrafted Kashmiri Walnut Wood Bowl"
+                          value={preferredTitle}
+                          onChange={(e) => setPreferredTitle(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs text-slate-900 focus:ring-1 focus:ring-blue-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Preferred Brand
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. Bhartiye Crafts"
+                          value={preferredBrand}
+                          onChange={(e) => setPreferredBrand(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs text-slate-900 focus:ring-1 focus:ring-blue-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                        Additional Craft / Artisan Details
+                      </label>
+                      <textarea
+                        rows={2}
+                        placeholder="Add artisan background, heritage craft origin, wood seasoning, or specific dimensions..."
+                        value={sellerAdditionalDetails}
+                        onChange={(e) => setSellerAdditionalDetails(e.target.value)}
+                        className="w-full p-2 border border-slate-200 rounded-lg text-xs text-slate-900 focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  {/* AI Listing Generation Preferences */}
+                  <div className="p-4 border border-slate-200 rounded-xl space-y-3 bg-white">
+                    <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+                      <Sliders className="w-4 h-4 text-indigo-600" />
+                      <h4 className="font-bold text-sm text-slate-900">
+                        AI Listing Generation Preferences
+                      </h4>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Listing Tone
+                        </label>
+                        <select
+                          value={listingTone}
+                          onChange={(e) => setListingTone(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800 bg-white"
+                        >
+                          <option value="artisan">Artisanal & Cultural</option>
+                          <option value="professional">Formal & Professional</option>
+                          <option value="conversational">Conversational & Engaging</option>
+                          <option value="luxurious">Luxurious & Premium</option>
+                          <option value="minimalist">Minimalist & Direct</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Marketplace Style
+                        </label>
+                        <select
+                          value={listingMarketplaceFocus}
+                          onChange={(e) => setListingMarketplaceFocus(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800 bg-white"
+                        >
+                          <option value="general">Marketplace Neutral</option>
+                          <option value="amazon">Amazon India Focus</option>
+                          <option value="flipkart">Flipkart Focus</option>
+                          <option value="meesho">Meesho Value Focus</option>
+                          <option value="myntra">Myntra Fashion Focus</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Target Audience
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. Home decor lovers, festive shoppers"
+                          value={listingTargetAudience}
+                          onChange={(e) => setListingTargetAudience(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs text-slate-900"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="pt-1">
+                      <label className="inline-flex items-center gap-2 cursor-pointer text-xs text-slate-700 font-medium">
+                        <input
+                          type="checkbox"
+                          checked={listingIncludeStylingTips}
+                          onChange={(e) => setListingIncludeStylingTips(e.target.checked)}
+                          className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                        />
+                        <span>Include care, maintenance, and styling tips in product story</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Generation Footer & Trigger */}
+                  <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                    {isVisionTokenExpired && (
+                      <div className="p-3 bg-amber-50 border border-amber-300 text-amber-800 rounded-lg text-xs font-medium flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                        <span>
+                          Vision session token has expired (15-minute TTL). Please upload or re-analyze the image to establish a valid cryptographic session.
+                        </span>
+                      </div>
+                    )}
+
+                    {listingError && (
+                      <div className="p-3 bg-red-50 border border-red-300 text-red-800 rounded-lg text-xs font-medium flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
+                        <span>{listingError}</span>
+                      </div>
+                    )}
+
+                    <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+                      <div className="text-[11px] text-slate-500">
+                        <span>Phase 03.3.4 • Orchestrates grounded listing generation from verified vision tokens.</span>
+                      </div>
+
+                      <div className="flex items-center gap-2 w-full sm:w-auto">
+                        <button
+                          type="button"
+                          onClick={() => setVisionStep(1)}
+                          className="px-3.5 py-2.5 bg-white border border-slate-300 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-100 transition-colors"
+                        >
+                          New Photo
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleGenerateListingDraft}
+                          disabled={
+                            isGeneratingListing ||
+                            isVisionTokenExpired ||
+                            (visionMultipleProducts && !focalProductSelection.trim())
+                          }
+                          className="flex-1 sm:flex-initial px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
+                        >
+                          {isGeneratingListing ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                              <span>Generating Grounded Draft...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-4 h-4 text-amber-300" />
+                              <span>Generate Grounded AI Listing Draft →</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* ==================================================== */}
+          {/* STEP 3: GROUNDED AI LISTING DRAFT REVIEW & EDIT       */}
+          {/* ==================================================== */}
+          {visionStep === 3 && (
+            <div className="space-y-6">
+              {/* Draft Status & Provenance Banner */}
+              <div className="p-4 rounded-xl border border-blue-200 bg-blue-50/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-blue-600" />
+                    <h3 className="font-bold text-sm text-blue-900">
+                      Grounded AI Listing Draft Generated
+                    </h3>
+                    {listingIsFallback ? (
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+                        Fallback Generator Used
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                        Provider: {listingAiProvider.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-blue-700">
+                    Draft is grounded in cryptographically verified visual evidence and seller inputs. Review, adjust, and approve before persisting to catalog.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setVisionStep(2)}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold transition-colors"
+                  >
+                    ← Back to Evidence
+                  </button>
+                </div>
+              </div>
+
+              {/* Error banner if persistence or edit fails */}
+              {listingError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-xl flex items-center gap-2 text-xs font-medium">
+                  <AlertCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
+                  <span>{listingError}</span>
+                </div>
+              )}
+
+              {/* Validation Warnings or Confirmation Required Alert */}
+              {(listingConfirmationFields.length > 0 || listingValidationWarnings.length > 0) && (
+                <div className="p-4 rounded-xl border border-amber-200 bg-amber-50 space-y-2 text-xs">
+                  <div className="flex items-center gap-2 text-amber-800 font-bold">
+                    <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                    <span>Attention: Fields Requiring Seller Confirmation or Warnings</span>
+                  </div>
+                  {listingConfirmationFields.length > 0 && (
+                    <div className="text-amber-700">
+                      <span className="font-semibold">Confirm with physical product: </span>
+                      {listingConfirmationFields.join(', ')}
+                    </div>
+                  )}
+                  {listingValidationWarnings.length > 0 && (
+                    <ul className="list-disc pl-5 space-y-1 text-amber-700 text-[11px]">
+                      {listingValidationWarnings.map((warn, wIdx) => (
+                        <li key={wIdx}>{warn}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Left 2 Cols: Main Content Review & Editing */}
+                <div className="lg:col-span-2 space-y-5">
+                  {/* Title & Descriptions Card */}
+                  <div className="p-5 border border-slate-200 rounded-xl space-y-4 bg-white shadow-sm">
+                    <div>
+                      <div className="flex justify-between items-center mb-1">
+                        <label className="block font-bold text-xs text-slate-800">
+                          Listing Title <span className="text-red-500">*</span>
+                        </label>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          {listingTitle.length} chars (aim for 50-150)
+                        </span>
+                      </div>
+                      <input
+                        type="text"
+                        value={listingTitle}
+                        onChange={(e) => setListingTitle(e.target.value)}
+                        className="w-full p-2.5 border border-slate-300 rounded-lg text-sm font-semibold text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block font-bold text-xs text-slate-800 mb-1">
+                        Short Description / Highlight
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={listingShortDesc}
+                        onChange={(e) => setListingShortDesc(e.target.value)}
+                        className="w-full p-2.5 border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block font-bold text-xs text-slate-800 mb-1">
+                        Full Product Story & Description
+                      </label>
+                      <textarea
+                        rows={6}
+                        value={listingDesc}
+                        onChange={(e) => setListingDesc(e.target.value)}
+                        className="w-full p-2.5 border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100">
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-600 mb-1">Product Type</label>
+                        <input
+                          type="text"
+                          value={listingProductType}
+                          onChange={(e) => setListingProductType(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-600 mb-1">Primary Category</label>
+                        <input
+                          type="text"
+                          value={listingCategoryPrimary}
+                          onChange={(e) => setListingCategoryPrimary(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-600 mb-1">Subcategory</label>
+                        <input
+                          type="text"
+                          value={listingCategorySub}
+                          onChange={(e) => setListingCategorySub(e.target.value)}
+                          className="w-full p-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Bullet Points Card */}
+                  <div className="p-5 border border-slate-200 rounded-xl space-y-3 bg-white shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        <h4 className="font-bold text-xs text-slate-800">
+                          Key Bullet Points ({listingBulletPoints.length}/6)
+                        </h4>
+                      </div>
+                      {listingBulletPoints.length < 6 && (
+                        <button
+                          type="button"
+                          onClick={handleAddBulletPoint}
+                          className="text-[11px] font-semibold text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> Add Point
+                        </button>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      {listingBulletPoints.map((bp, bpIdx) => (
+                        <div key={bpIdx} className="flex items-start gap-2">
+                          <span className="w-5 h-5 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center font-bold text-[10px] mt-2 flex-shrink-0">
+                            {bpIdx + 1}
+                          </span>
+                          <input
+                            type="text"
+                            value={bp}
+                            onChange={(e) => handleUpdateBulletPoint(bpIdx, e.target.value)}
+                            className="flex-1 p-2 border border-slate-200 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-blue-500"
+                          />
+                          {listingBulletPoints.length > 3 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveBulletPoint(bpIdx)}
+                              className="p-2 text-slate-400 hover:text-red-500 rounded-lg transition-colors"
+                              title="Remove bullet point"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Grounded Attributes Card */}
+                  <div className="p-5 border border-slate-200 rounded-xl space-y-3 bg-white shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Tag className="w-4 h-4 text-indigo-600" />
+                        <h4 className="font-bold text-xs text-slate-800">
+                          Grounded Product Attributes ({listingAttributes.length})
+                        </h4>
+                      </div>
+                      <span className="text-[10px] text-slate-400">
+                        Mapped to catalog attributes on approval
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {listingAttributes.map((attr, aIdx) => (
+                        <div
+                          key={aIdx}
+                          className="p-3 border border-slate-200 rounded-xl bg-slate-50 space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between gap-1 flex-wrap">
+                            <span className="font-bold text-xs font-mono text-slate-700 uppercase">
+                              {attr.name.replace(/_/g, ' ')}
+                            </span>
+                            {renderListingProvenanceBadge(attr.provenance, attr.requires_confirmation)}
+                          </div>
+                          <input
+                            type="text"
+                            value={attr.value || ''}
+                            onChange={(e) => handleUpdateDraftAttribute(aIdx, 'value', e.target.value)}
+                            className="w-full p-1.5 bg-white border border-slate-200 rounded text-xs font-medium text-slate-900"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Search Keywords Card */}
+                  <div className="p-5 border border-slate-200 rounded-xl space-y-3 bg-white shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <FolderTree className="w-4 h-4 text-purple-600" />
+                        <h4 className="font-bold text-xs text-slate-800">
+                          Search Keywords ({listingKeywords.length})
+                        </h4>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {listingKeywords.map((kw, kwIdx) => (
+                        <span
+                          key={kwIdx}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-purple-50 text-purple-700 border border-purple-200 text-xs font-medium"
+                        >
+                          <span>{kw}</span>
+                          {listingKeywords.length > 3 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveKeyword(kw)}
+                              className="text-purple-400 hover:text-red-500 rounded-full"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                    <form onSubmit={handleAddKeyword} className="flex gap-2 pt-1">
+                      <input
+                        type="text"
+                        placeholder="Add new keyword tag..."
+                        value={newKeywordInput}
+                        onChange={(e) => setNewKeywordInput(e.target.value)}
+                        className="flex-1 p-2 border border-slate-200 rounded-lg text-xs"
+                      />
+                      <button
+                        type="submit"
+                        className="px-3 py-2 bg-purple-600 text-white rounded-lg text-xs font-bold hover:bg-purple-700"
+                      >
+                        Add Tag
+                      </button>
+                    </form>
+                  </div>
+                </div>
+
+                {/* Right 1 Col: Photo Thumbnail, SEO Snippet & Master Product Catalog Save */}
+                <div className="space-y-5">
+                  {/* Photo Preview & Grounding Source */}
+                  <div className="p-4 border border-slate-200 rounded-xl bg-slate-50 space-y-3">
+                    <span className="font-bold text-xs text-slate-700 block">Verified Source Photo</span>
+                    {visionPreview && (
+                      <div className="relative aspect-video rounded-lg overflow-hidden bg-slate-900 flex items-center justify-center">
+                        <img src={visionPreview} alt="Product Source" className="max-h-full max-w-full object-contain" />
+                      </div>
+                    )}
+                    <div className="text-[10px] text-slate-500 space-y-1">
+                      <div>Brand: <strong className="text-slate-700">{listingBrand}</strong></div>
+                      <div>Engine: <strong className="text-slate-700">{draftMetadata?.ai_provider || listingAiProvider}</strong></div>
+                      <div>Grounding Confidence: <strong className="text-emerald-600">{draftMetadata?.provenance_reconciliation?.reconciliation_stats?.grounded_attributes ?? 'Verified'} grounded</strong></div>
+                    </div>
+                  </div>
+
+                  {/* SEO Metadata Snippet Card */}
+                  <div className="p-4 border border-slate-200 rounded-xl bg-white shadow-sm space-y-2">
+                    <span className="font-bold text-xs text-slate-700 flex items-center gap-1.5">
+                      <Globe className="w-3.5 h-3.5 text-blue-600" /> Search Snippet (SEO)
+                    </span>
+                    <div className="p-3 bg-slate-50 rounded-lg border border-slate-100 space-y-1">
+                      <p className="text-blue-700 text-xs font-medium truncate hover:underline cursor-pointer">
+                        {listingSeo?.meta_title || listingTitle}
+                      </p>
+                      <p className="text-[10px] text-emerald-700 truncate">
+                        https://bhartiyecrafts.com/products/{listingSeo?.slug || 'handcrafted-item'}
+                      </p>
+                      <p className="text-[11px] text-slate-600 line-clamp-2">
+                        {listingSeo?.meta_description || listingShortDesc || listingDesc}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Master Product Catalog Persistence Card */}
+                  <div className="p-5 border-2 border-emerald-500/40 bg-emerald-50/30 rounded-2xl space-y-4 shadow-sm">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <Package className="w-4 h-4 text-emerald-600" />
+                        <h4 className="font-bold text-sm text-slate-900">Create Master Product</h4>
+                      </div>
+                      <p className="text-[11px] text-slate-600">
+                        Final seller review. Approving saves this listing into your MongoDB Product catalog.
+                      </p>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div>
+                        <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                          Product SKU <span className="text-red-500">*</span>
+                        </label>
+                        <input
+                          type="text"
+                          value={listingSku}
+                          onChange={(e) => setListingSku(e.target.value.toUpperCase())}
+                          placeholder="e.g. BC-WOD-001"
+                          className="w-full p-2 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 uppercase"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                            Master Price (₹) <span className="text-red-500">*</span>
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={listingPrice}
+                            onChange={(e) => setListingPrice(e.target.value)}
+                            className="w-full p-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-900"
+                          />
+                        </div>
+                        <div>
+                          <label className="block font-bold text-[11px] text-slate-700 mb-1">
+                            Inventory Stock
+                          </label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={listingStock}
+                            onChange={(e) => setListingStock(e.target.value)}
+                            className="w-full p-2 border border-slate-300 rounded-lg text-xs text-slate-900"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="p-2.5 bg-white border border-emerald-200 rounded-lg text-[10px] text-emerald-800 space-y-0.5">
+                        <span className="font-bold block">✓ Catalog Persistence Rules:</span>
+                        <span>• Grounded attributes map directly to Product attribute Map</span>
+                        <br />
+                        <span>• Multi-marketplace publishing disabled until Phase 03.5</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleApproveAndCreateMasterProduct}
+                        disabled={isSavingMasterProduct || !listingSku.trim() || !listingPrice}
+                        className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
+                      >
+                        {isSavingMasterProduct ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Persisting Master Product in Catalog...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Check className="w-4 h-4" />
+                            <span>Seller Approves → Create Master Product</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ==================================================== */}
+          {/* STEP 4: MASTER PRODUCT CREATED CONFIRMATION          */}
+          {/* ==================================================== */}
+          {visionStep === 4 && (
+            <div className="p-8 border border-emerald-200 bg-emerald-50/50 rounded-2xl text-center space-y-5 max-w-xl mx-auto shadow-sm">
+              <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 mx-auto flex items-center justify-center">
+                <Check className="w-8 h-8" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-lg font-extrabold text-slate-900">
+                  Master Product Successfully Created!
+                </h3>
+                <p className="text-xs text-slate-600">
+                  Your grounded AI listing draft has been approved and permanently saved into the catalog.
+                </p>
+              </div>
+
+              <div className="p-4 bg-white border border-emerald-200 rounded-xl text-left space-y-2 text-xs">
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-slate-500">Product Title:</span>
+                  <span className="font-bold text-slate-900 truncate max-w-xs">{listingTitle}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-slate-500">SKU:</span>
+                  <span className="font-mono font-bold text-slate-900">{listingSku}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-slate-500">Master Price:</span>
+                  <span className="font-bold text-emerald-600">₹{listingPrice}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-slate-500">Category:</span>
+                  <span className="font-medium text-slate-800">{listingCategoryPrimary || 'Fashion'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Catalog ID:</span>
+                  <span className="font-mono text-slate-600 text-[11px] truncate max-w-xs">
+                    {masterProductSuccess?._id || masterProductSuccess?.id || 'Persisted in MongoDB'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-center gap-3 pt-2">
+                <Link
+                  to="/products"
+                  className="px-5 py-2.5 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-colors shadow-sm flex items-center gap-1.5"
+                >
+                  <Package className="w-4 h-4" />
+                  <span>View in Product Catalog</span>
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleRemoveFile();
+                    setGeneratedDraft(null);
+                    setDraftMetadata(null);
+                    setMasterProductSuccess(null);
+                    setVisionStep(1);
+                  }}
+                  className="px-5 py-2.5 bg-white border border-slate-300 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-50 transition-colors"
+                >
+                  Create Another Listing
+                </button>
               </div>
             </div>
           )}

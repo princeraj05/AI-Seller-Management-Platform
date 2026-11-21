@@ -58,8 +58,13 @@ api.interceptors.response.use(
       originalRequest.url?.includes('/auth/google') ||
       originalRequest.url?.includes('/auth/logout');
 
-    // Handle 401 Unauthorized, excluding auth endpoints themselves
-    if (status === 401 && !originalRequest._retry && !isAuthRoute) {
+    const isVisionTokenError =
+      error.response.data?.code === 'VISION_TOKEN_EXPIRED' ||
+      error.response.data?.code === 'INVALID_VISION_TOKEN' ||
+      Boolean(originalRequest.skipAuthRefresh);
+
+    // Handle 401 Unauthorized, excluding auth endpoints and vision-token specific errors
+    if (status === 401 && !originalRequest._retry && !isAuthRoute && !isVisionTokenError) {
       // Single-flight lock: concurrent expired requests join queue
       if (isRefreshing) {
         return new Promise((resolve, reject) => {

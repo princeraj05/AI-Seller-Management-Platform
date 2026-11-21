@@ -57,3 +57,32 @@ export const validateVisionContractApi = async (payload) => {
     throw new Error(error.message || 'Network error during contract validation');
   }
 };
+
+/**
+ * Generates an evidence-grounded, marketplace-neutral product listing draft
+ * using verified vision tokens, seller corrections, and listing preferences.
+ *
+ * @param {Object} payload - { vision_token, seller_corrections, client_vision_data, preferences }
+ * @returns {Promise<Object>}
+ */
+export const generateListingDraftApi = async (payload) => {
+  try {
+    const response = await api.post('/ai/generate-listing', payload, {
+      timeout: 60000,
+      skipAuthRefresh: true,
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response && error.response.data) {
+      const serverMessage = error.response.data.message || error.response.data.error;
+      const err = new Error(serverMessage || 'Listing generation failed');
+      err.code = error.response.data.code || 'LISTING_GENERATION_FAILED';
+      err.status = error.response.status;
+      err.details = error.response.data;
+      throw err;
+    }
+    const err = new Error(error.message || 'Network error during listing generation');
+    err.code = 'NETWORK_ERROR';
+    throw err;
+  }
+};
