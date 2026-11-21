@@ -302,30 +302,155 @@ export class AmazonSpApiClient {
   }
 
   /**
-   * Retrieve Financial Events for an Order (Finances API v0)
-   * Strictly read-only operation to obtain refund events, shipment adjustments, and item adjustments.
+   * Retrieve Financial Events for an Order (Finances API v0 — listFinancialEventsByOrderId)
+   * Strictly read-only operation with full NextToken pagination and infinite-loop protection.
    *
-   * @param {string} orderId
-   * @returns {Promise<Object|null>} FinancialEvents payload or null if not found/unauthorized
+   * Note: Financial refund events do NOT prove a physical product return occurred.
+   *
+   * @param {string} orderId Amazon order ID
+   * @param {Object} [options]
+   * @param {number} [options.maxResultsPerPage=100] Official MaxResultsPerPage (1..100)
+   * @param {number} [options.maxPages=10] Safety cap on paginated requests (1..50)
+   * @param {boolean} [options.throwOnError=false] When true, re-throw structured error on 400/403/404
+   * @returns {Promise<Object|null>} Merged FinancialEvents payload with secret-safe `_diagnostics`, or null if 403/404 when throwOnError=false
    */
-  async getOrderFinancialEvents(orderId) {
-    const cleanId = String(orderId).trim();
-    const endpointPath = `/finances/v0/orders/${encodeURIComponent(cleanId)}/financialEvents`;
+  async getOrderFinancialEvents(orderId, options = {}) {
+    const cleanId = String(orderId || '').trim();
+    if (!cleanId) {
+      const err = new Error('orderId is required for Finances API listFinancialEventsByOrderId.');
+      err.code = 'INVALID_ORDER_ID';
+      err.status = 400;
+      throw err;
+    }
+
+    const rawMaxResults = options.maxResultsPerPage ?? 100;
+    const maxResultsPerPage = Number(rawMaxResults);
+    if (!Number.isInteger(maxResultsPerPage) || maxResultsPerPage < 1 || maxResultsPerPage > 100) {
+      const err = new Error('Finances API v0 MaxResultsPerPage must be an integer between 1 and 100.');
+      err.code = 'INVALID_MAX_RESULTS_PER_PAGE';
+      err.status = 400;
+      throw err;
+    }
+
+    const maxPages = Math.min(Math.max(Number(options.maxPages) || 10, 1), 50);
+    const basePath = `/finances/v0/orders/${encodeURIComponent(cleanId)}/financialEvents`;
+
+    const mergedEvents = {};
+    const seenTokens = new Set();
+    const pageDiagnostics = [];
+    let currentNextToken = null;
+    let pagesFetched = 0;
+    let truncatedReason = null;
+
+    const mergeFinancialEventLists = (pageEvents) => {
+      if (!pageEvents || typeof pageEvents !== 'object') return;
+      for (const [key, value] of Object.entries(pageEvents)) {
+        if (Array.isArray(value)) {
+          if (!Array.isArray(mergedEvents[key])) {
+            mergedEvents[key] = [];
+          }
+          mergedEvents[key].push(...value);
+        } else if (mergedEvents[key] === undefined) {
+          mergedEvents[key] = value;
+        }
+      }
+    };
 
     try {
-      const responseData = await this.executeRequest(endpointPath, {
-        operation: 'getOrderFinancialEvents',
-      });
-      return responseData.FinancialEvents || responseData.payload?.FinancialEvents || responseData;
+      while (pagesFetched < maxPages) {
+        const params = new URLSearchParams({
+          MaxResultsPerPage: String(maxResultsPerPage),
+        });
+        if (currentNextToken) {
+          params.set('NextToken', currentNextToken);
+        }
+
+        const endpointPath = `${basePath}?${params.toString()}`;
+        const responseData = await this.executeRequest(endpointPath, {
+          method: 'GET',
+          operation: 'listFinancialEventsByOrderId',
+        });
+
+        pagesFetched++;
+        const pageDiag = this.getLastRequestDiagnostics();
+        if (pageDiag) pageDiagnostics.push(pageDiag);
+
+        const payload = responseData?.payload || responseData || {};
+        const pageEvents = payload.FinancialEvents || responseData?.FinancialEvents || {};
+        mergeFinancialEventLists(pageEvents);
+
+        const nextToken =
+          typeof payload.NextToken === 'string' && payload.NextToken.trim()
+            ? payload.NextToken.trim()
+            : typeof responseData?.NextToken === 'string' && responseData.NextToken.trim()
+            ? responseData.NextToken.trim()
+            : null;
+
+        if (!nextToken) {
+          currentNextToken = null;
+          break;
+        }
+
+        // Prevent infinite pagination loops if Amazon or a proxy repeats a NextToken
+        if (seenTokens.has(nextToken)) {
+          truncatedReason = 'REPEATED_NEXT_TOKEN';
+          break;
+        }
+
+        seenTokens.add(nextToken);
+        currentNextToken = nextToken;
+
+        if (pagesFetched >= maxPages) {
+          truncatedReason = 'MAX_PAGES_REACHED';
+          break;
+        }
+      }
+
+      const summaryDiagnostics = {
+        operation: 'listFinancialEventsByOrderId',
+        endpoint: basePath,
+        pagesFetched,
+        hasMorePages: Boolean(truncatedReason),
+        truncatedReason,
+        refundDoesNotImplyPhysicalReturn: true,
+        lastDiagnostics: pageDiagnostics[pageDiagnostics.length - 1] || null,
+        pageDiagnostics,
+        executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+      };
+      this.lastFinancesDiagnostics = summaryDiagnostics;
+
+      return {
+        ...mergedEvents,
+        _diagnostics: summaryDiagnostics,
+      };
     } catch (error) {
-      if (error.status === 404 || error.status === 400) {
+      const diagnostics = error.diagnostics || this.getLastRequestDiagnostics();
+      this.lastFinancesDiagnostics = {
+        operation: 'listFinancialEventsByOrderId',
+        endpoint: basePath,
+        pagesFetched,
+        httpStatus: error.status || null,
+        code: error.code || 'FINANCES_API_ERROR',
+        diagnostics,
+        executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      };
+
+      if (!options.throwOnError && (error.status === 404 || error.status === 400)) {
         return null;
       }
-      if (error.status === 403 || error.code === 'FORBIDDEN') {
-        console.warn(`[Amazon SP-API Finances] Finance role not authorized or restricted for order ${orderId}:`, error.message);
+      if (!options.throwOnError && (error.status === 403 || error.code === 'FORBIDDEN')) {
+        console.warn(
+          `[Amazon SP-API Finances] Finance role not authorized or restricted for order ${cleanId}: status=${error.status || 403} requestId=${diagnostics?.requestId || 'N/A'}`
+        );
         return null;
       }
-      throw error;
+
+      const wrapped = new Error(error.message || 'Amazon Finances API request failed.');
+      wrapped.status = error.status || 500;
+      wrapped.code = error.code || 'FINANCES_API_ERROR';
+      wrapped.diagnostics = diagnostics;
+      wrapped.executionOutcome = AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE;
+      throw wrapped;
     }
   }
 

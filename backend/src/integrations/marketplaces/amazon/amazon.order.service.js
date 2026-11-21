@@ -12,7 +12,7 @@ import {
 import { isProductionEnv } from '../../../config/storage.js';
 import { inMemoryReturnsMap } from '../../../modules/returns/return.service.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
-import { AmazonSpApiClient } from './amazon.client.js';
+import { AmazonSpApiClient, AMAZON_EXECUTION_OUTCOMES } from './amazon.client.js';
 import {
   mapAmazonOrderStatus,
   mapFulfillmentChannel,
@@ -35,97 +35,232 @@ const withDbTimeout = (promise, ms = 2000) => {
   ]);
 };
 
+export const ORDERS_V2026_FULFILLMENT_STATUSES = Object.freeze([
+  'PENDING_AVAILABILITY',
+  'PENDING',
+  'UNSHIPPED',
+  'PARTIALLY_SHIPPED',
+  'SHIPPED',
+  'CANCELLED',
+  'UNFULFILLABLE',
+]);
+
+export const ORDERS_V2026_FULFILLED_BY = Object.freeze(['MERCHANT', 'AMAZON']);
+
+export const ORDERS_V2026_INCLUDED_DATA = Object.freeze([
+  'BUYER',
+  'RECIPIENT',
+  'PROCEEDS',
+  'EXPENSE',
+  'PROMOTION',
+  'CANCELLATION',
+  'FULFILLMENT',
+  'PACKAGES',
+  'TAX',
+  'PAYMENT',
+  'FULFILLMENT_ORDERS',
+]);
+
+const normalizeFulfilledByValue = (raw) => {
+  const val = String(raw || '').trim().toUpperCase();
+  if (!val) return null;
+  if (val === 'AMAZON' || val === 'AFN' || val === 'FBA') return 'AMAZON';
+  if (val === 'MERCHANT' || val === 'MFN' || val === 'FBM') return 'MERCHANT';
+  return val;
+};
+
+const wrapOrdersApiError = (error, client, { marketplaceId, operation }) => {
+  const diagnostics =
+    error.diagnostics ||
+    (typeof client?.getLastRequestDiagnostics === 'function'
+      ? client.getLastRequestDiagnostics()
+      : null);
+  const amazonFirstError = Array.isArray(error.sanitizedData?.errors)
+    ? error.sanitizedData.errors[0]
+    : null;
+  const amazonErrorCode = amazonFirstError?.code || error.code || 'API_ERROR';
+  const amazonErrorMessage = amazonFirstError?.message || error.message || 'Amazon Orders API request failed.';
+  const amazonErrorDetails = amazonFirstError?.details || '';
+
+  const wrapped = new Error(amazonErrorMessage);
+  wrapped.status = error.status || 500;
+  wrapped.code =
+    error.status === 401
+      ? 'LWA_UNAUTHORIZED'
+      : error.status === 403
+      ? 'SP_API_FORBIDDEN'
+      : error.status === 429
+      ? 'RATE_LIMITED'
+      : error.code || amazonErrorCode || 'ORDERS_API_ERROR';
+  wrapped.amazonErrorCode = amazonErrorCode;
+  wrapped.amazonErrorMessage = amazonErrorMessage;
+  wrapped.amazonErrorDetails = amazonErrorDetails;
+  wrapped.marketplaceId = marketplaceId;
+  wrapped.environment = client?.isSandbox !== false ? 'sandbox' : 'production';
+  wrapped.region = client?.region || 'eu';
+  wrapped.operation = operation;
+  wrapped.diagnostics = diagnostics;
+  wrapped.executionOutcome = AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE;
+  return wrapped;
+};
+
 /**
- * Search Amazon Orders using Orders API v2026-01-01
- * Read-only operation.
+ * Search Amazon Orders using official Orders API v2026-01-01 (searchOrders)
+ * Strictly read-only operation.
  *
- * Official v2026-01-01 Parameters:
- * - marketplaceIds: Comma-separated list of marketplace IDs
- * - createdAfter / lastUpdatedAfter: ISO8601 strings
- * - orderStatuses: Array or comma-separated list of official v2026-01-01 status enums
- * - fulfillmentChannels: AFN, MFN
- * - includedData: Optional dataset blocks (BUYER, RECIPIENT, PROCEEDS, EXPENSE, PROMOTION, FULFILLMENT, PACKAGES, TAX, PAYMENT)
- * - pageSize: Number of orders per page (1-100)
- * - pageToken: Pagination cursor token
+ * Official v2026-01-01 Query Parameters (models/orders-api-model/orders_2026-01-01.json):
+ * - marketplaceIds: Comma-separated marketplace IDs (default India A21TJRUUN4KGV)
+ * - createdAfter / createdBefore OR lastUpdatedAfter / lastUpdatedBefore (mutually exclusive ISO 8601)
+ * - fulfillmentStatuses: Official FulfillmentStatus enum values (also accepts legacy alias options.orderStatuses)
+ * - fulfilledBy: Official enum ['MERCHANT', 'AMAZON'] (maps legacy AFN/MFN/FBA/FBM aliases)
+ * - includedData: Official dataset enums (PII datasets BUYER/RECIPIENT never auto-included)
+ * - maxResultsPerPage: Integer 1..100 (also accepts legacy alias options.pageSize)
+ * - paginationToken: Next page cursor token (also accepts legacy aliases options.pageToken / options.nextToken)
+ *
+ * Never silently swallows HTTP 400/404 errors; throws structured secret-safe diagnostics.
  *
  * @param {AmazonSpApiClient} client
  * @param {Object} [options]
- * @returns {Promise<{ orders: Array, pagination: Object, marketplaceId: string }>}
+ * @returns {Promise<{ orders: Array, pagination: Object, marketplaceId: string, diagnostics: Object|null, executionOutcome: string }>}
  */
 export const searchAmazonOrders = async (client, options = {}) => {
-  const marketplaceId = options.marketplaceId || client.credentials?.marketplaceId || 'A21TJRUUN4KGV';
+  const marketplaceId = String(
+    options.marketplaceId || client.credentials?.marketplaceId || 'A21TJRUUN4KGV'
+  ).trim();
 
   const queryParams = new URLSearchParams({
     marketplaceIds: marketplaceId,
   });
 
+  // Official spec: createdAfter/createdBefore and lastUpdatedAfter/lastUpdatedBefore are mutually exclusive
   if (options.lastUpdatedAfter) {
     queryParams.set('lastUpdatedAfter', new Date(options.lastUpdatedAfter).toISOString());
+    if (options.lastUpdatedBefore) {
+      queryParams.set('lastUpdatedBefore', new Date(options.lastUpdatedBefore).toISOString());
+    }
   } else if (options.createdAfter) {
     queryParams.set('createdAfter', new Date(options.createdAfter).toISOString());
+    if (options.createdBefore) {
+      queryParams.set('createdBefore', new Date(options.createdBefore).toISOString());
+    }
   }
 
-  if (options.orderStatuses) {
-    const statuses = Array.isArray(options.orderStatuses)
-      ? options.orderStatuses.join(',')
-      : String(options.orderStatuses);
-    queryParams.set('orderStatuses', statuses);
+  // Official v2026-01-01 parameter: fulfillmentStatuses (supports legacy options.orderStatuses alias)
+  const rawStatuses = options.fulfillmentStatuses ?? options.orderStatuses;
+  if (rawStatuses !== undefined && rawStatuses !== null && rawStatuses !== '') {
+    const list = (Array.isArray(rawStatuses) ? rawStatuses : String(rawStatuses).split(','))
+      .map((s) => String(s || '').trim().toUpperCase())
+      .filter(Boolean);
+    const invalid = list.filter((s) => !ORDERS_V2026_FULFILLMENT_STATUSES.includes(s));
+    if (invalid.length > 0) {
+      const err = new Error(
+        `Invalid fulfillmentStatuses value(s) for Orders API v2026-01-01: ${invalid.join(', ')}.`
+      );
+      err.code = 'INVALID_FULFILLMENT_STATUS';
+      err.status = 400;
+      throw err;
+    }
+    if (list.length > 0) {
+      queryParams.set('fulfillmentStatuses', Array.from(new Set(list)).join(','));
+    }
   }
 
-  if (options.fulfillmentChannels) {
-    const channels = Array.isArray(options.fulfillmentChannels)
-      ? options.fulfillmentChannels.join(',')
-      : String(options.fulfillmentChannels);
-    queryParams.set('fulfillmentChannels', channels);
+  // Official v2026-01-01 parameter: fulfilledBy ('MERCHANT' | 'AMAZON'); maps legacy AFN/MFN/FBA/FBM aliases
+  const rawFulfilledBy = options.fulfilledBy ?? options.fulfillmentChannels;
+  if (rawFulfilledBy !== undefined && rawFulfilledBy !== null && rawFulfilledBy !== '') {
+    const list = (Array.isArray(rawFulfilledBy) ? rawFulfilledBy : String(rawFulfilledBy).split(','))
+      .map(normalizeFulfilledByValue)
+      .filter(Boolean);
+    const invalid = list.filter((v) => !ORDERS_V2026_FULFILLED_BY.includes(v));
+    if (invalid.length > 0) {
+      const err = new Error(
+        `Invalid fulfilledBy value(s) for Orders API v2026-01-01: ${invalid.join(', ')}. Expected MERCHANT or AMAZON.`
+      );
+      err.code = 'INVALID_FULFILLED_BY';
+      err.status = 400;
+      throw err;
+    }
+    if (list.length > 0) {
+      queryParams.set('fulfilledBy', Array.from(new Set(list)).join(','));
+    }
   }
 
+  // Official v2026-01-01 parameter: includedData
   if (options.includedData) {
-    const inc = Array.isArray(options.includedData)
-      ? options.includedData.join(',')
-      : String(options.includedData);
-    queryParams.set('includedData', inc);
+    const incList = (Array.isArray(options.includedData)
+      ? options.includedData
+      : String(options.includedData).split(',')
+    )
+      .map((d) => String(d || '').trim().toUpperCase())
+      .filter((d) => ORDERS_V2026_INCLUDED_DATA.includes(d));
+    if (incList.length > 0) {
+      queryParams.set('includedData', Array.from(new Set(incList)).join(','));
+    }
   }
 
-  const pageSize = Math.min(Math.max(Number(options.pageSize) || 50, 1), 100);
-  queryParams.set('pageSize', String(pageSize));
+  // Official v2026-01-01 parameter: maxResultsPerPage (integer 1..100; supports legacy options.pageSize alias)
+  const rawMax = options.maxResultsPerPage ?? options.pageSize;
+  let maxResultsPerPage = 50;
+  if (rawMax !== undefined && rawMax !== null && rawMax !== '') {
+    const parsedMax = Number(rawMax);
+    if (!Number.isInteger(parsedMax) || parsedMax < 1 || parsedMax > 100) {
+      const err = new Error(
+        'Orders API v2026-01-01 maxResultsPerPage must be an integer between 1 and 100.'
+      );
+      err.code = 'INVALID_MAX_RESULTS_PER_PAGE';
+      err.status = 400;
+      throw err;
+    }
+    maxResultsPerPage = parsedMax;
+  }
+  queryParams.set('maxResultsPerPage', String(maxResultsPerPage));
 
-  if (options.pageToken) {
-    queryParams.set('pageToken', options.pageToken);
-  } else if (options.nextToken) {
-    queryParams.set('pageToken', options.nextToken);
+  // Official v2026-01-01 parameter: paginationToken (supports legacy options.pageToken / nextToken aliases)
+  const rawPaginationToken = options.paginationToken || options.pageToken || options.nextToken;
+  if (rawPaginationToken && String(rawPaginationToken).trim()) {
+    queryParams.set('paginationToken', String(rawPaginationToken).trim());
   }
 
   const endpointPath = `/orders/2026-01-01/orders?${queryParams.toString()}`;
 
   try {
-    const responseData = await client.executeRequest(endpointPath);
-    const orders = responseData.orders || responseData.payload?.Orders || responseData.payload?.orders || [];
-    const pageToken = responseData.pagination?.pageToken || responseData.pagination?.nextToken || responseData.nextToken || null;
+    const responseData = await client.executeRequest(endpointPath, {
+      method: 'GET',
+      operation: 'searchOrders',
+    });
+    const orders = responseData?.orders || responseData?.payload?.Orders || responseData?.payload?.orders || [];
+    const nextToken =
+      responseData?.pagination?.nextToken ||
+      responseData?.pagination?.pageToken ||
+      responseData?.nextToken ||
+      null;
+    const diagnostics =
+      typeof client.getLastRequestDiagnostics === 'function'
+        ? client.getLastRequestDiagnostics()
+        : responseData?._metadata || null;
 
     return {
       orders,
       pagination: {
-        pageToken,
-        nextToken: pageToken,
+        nextToken,
+        paginationToken: nextToken,
+        pageToken: nextToken,
       },
       marketplaceId,
+      diagnostics,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
     };
   } catch (error) {
-    if (error.status === 404 || error.status === 400) {
-      return {
-        orders: [],
-        pagination: { pageToken: null, nextToken: null },
-        marketplaceId,
-        note: 'No orders returned from Amazon Orders API.',
-      };
-    }
-    throw error;
+    throw wrapOrdersApiError(error, client, {
+      marketplaceId,
+      operation: 'searchOrders',
+    });
   }
 };
 
 /**
- * Get Amazon Order details by orderId using Orders API v2026-01-01
- * Read-only operation.
+ * Get Amazon Order details by orderId using Orders API v2026-01-01 (getOrder)
+ * Strictly read-only operation.
  *
  * @param {AmazonSpApiClient} client
  * @param {string} orderId
@@ -134,27 +269,41 @@ export const searchAmazonOrders = async (client, options = {}) => {
  * @returns {Promise<Object|null>}
  */
 export const getAmazonOrder = async (client, orderId, options = {}) => {
-  const cleanId = String(orderId).trim();
-  const queryParams = new URLSearchParams();
+  const cleanId = String(orderId || '').trim();
+  if (!cleanId) {
+    const err = new Error('orderId is required for Amazon Orders API getOrder.');
+    err.code = 'INVALID_ORDER_ID';
+    err.status = 400;
+    throw err;
+  }
 
+  const queryParams = new URLSearchParams();
   if (options.includedData) {
-    const inc = Array.isArray(options.includedData)
-      ? options.includedData.join(',')
-      : String(options.includedData);
-    queryParams.set('includedData', inc);
+    const incList = (Array.isArray(options.includedData)
+      ? options.includedData
+      : String(options.includedData).split(',')
+    )
+      .map((d) => String(d || '').trim().toUpperCase())
+      .filter((d) => ORDERS_V2026_INCLUDED_DATA.includes(d));
+    if (incList.length > 0) {
+      queryParams.set('includedData', Array.from(new Set(incList)).join(','));
+    }
   }
 
   const qs = queryParams.toString();
   const endpointPath = `/orders/2026-01-01/orders/${encodeURIComponent(cleanId)}${qs ? `?${qs}` : ''}`;
 
   try {
-    const responseData = await client.executeRequest(endpointPath);
-    return responseData.order || responseData.payload || responseData;
+    const responseData = await client.executeRequest(endpointPath, {
+      method: 'GET',
+      operation: 'getOrder',
+    });
+    return responseData?.order || responseData?.payload || responseData;
   } catch (error) {
-    if (error.status === 404) {
-      return null;
-    }
-    throw error;
+    throw wrapOrdersApiError(error, client, {
+      marketplaceId: client?.credentials?.marketplaceId || 'A21TJRUUN4KGV',
+      operation: 'getOrder',
+    });
   }
 };
 
@@ -343,8 +492,9 @@ export const syncAmazonOrdersService = async (tenant, options = {}) => {
       syncedOrders: [],
     };
 
-    // 7. Fetch orders with pagination using Orders API v2026-01-01 searchOrders
-    let currentPageToken = null;
+    // 7. Fetch orders with pagination using Orders API v2026-01-01 searchOrders (with repeated-token loop guard)
+    let currentPaginationToken = null;
+    const seenPaginationTokens = new Set();
     let pageCount = 0;
     const maxPages = options.maxPages || 5;
     const fetchedOrders = [];
@@ -354,17 +504,24 @@ export const syncAmazonOrdersService = async (tenant, options = {}) => {
       const searchRes = await searchAmazonOrders(client, {
         marketplaceId,
         lastUpdatedAfter: syncFilterDate,
-        orderStatuses: options.orderStatuses,
-        fulfillmentChannels: options.fulfillmentChannels,
-        pageSize: 50,
-        pageToken: currentPageToken,
+        fulfillmentStatuses: options.fulfillmentStatuses ?? options.orderStatuses,
+        fulfilledBy: options.fulfilledBy ?? options.fulfillmentChannels,
+        maxResultsPerPage: options.maxResultsPerPage ?? 50,
+        paginationToken: currentPaginationToken,
       });
 
       const pageOrders = searchRes.orders || [];
       fetchedOrders.push(...pageOrders);
 
-      currentPageToken = searchRes.pagination?.pageToken || searchRes.pagination?.nextToken || null;
-    } while (currentPageToken && pageCount < maxPages);
+      const nextToken = searchRes.pagination?.nextToken || searchRes.pagination?.paginationToken || null;
+      if (nextToken && seenPaginationTokens.has(nextToken)) {
+        break;
+      }
+      if (nextToken) {
+        seenPaginationTokens.add(nextToken);
+      }
+      currentPaginationToken = nextToken;
+    } while (currentPaginationToken && pageCount < maxPages);
 
     syncStats.totalFetched = fetchedOrders.length;
 

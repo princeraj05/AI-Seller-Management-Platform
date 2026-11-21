@@ -3,7 +3,7 @@ import { MarketplacePricing } from '../../../modules/channels/marketplacePricing
 import { MarketplaceListing } from '../../../modules/channels/marketplaceListing.model.js';
 import { SyncHistory } from '../../../modules/channels/syncHistory.model.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
-import { AmazonSpApiClient } from './amazon.client.js';
+import { AmazonSpApiClient, AMAZON_EXECUTION_OUTCOMES } from './amazon.client.js';
 import { mapAmazonOffersToPricing } from './amazon.pricing.mapper.js';
 import {
   inMemoryChannelsMap,
@@ -22,9 +22,49 @@ const withDbTimeout = (promise, ms = 2000) => {
   ]);
 };
 
+const wrapPricingApiError = (error, client, { marketplaceId, operation }) => {
+  const diagnostics =
+    error.diagnostics ||
+    (typeof client?.getLastRequestDiagnostics === 'function'
+      ? client.getLastRequestDiagnostics()
+      : null);
+  const amazonFirstError = Array.isArray(error.sanitizedData?.errors)
+    ? error.sanitizedData.errors[0]
+    : null;
+  const amazonErrorCode = amazonFirstError?.code || error.code || 'API_ERROR';
+  const amazonErrorMessage =
+    amazonFirstError?.message || error.message || 'Amazon Product Pricing API request failed.';
+  const amazonErrorDetails = amazonFirstError?.details || '';
+
+  const wrapped = new Error(amazonErrorMessage);
+  wrapped.status = error.status || 500;
+  wrapped.code =
+    error.status === 401
+      ? 'LWA_UNAUTHORIZED'
+      : error.status === 403
+      ? /not valid for region/i.test(`${amazonErrorMessage} ${amazonErrorDetails}`)
+        ? 'MARKETPLACE_REGION_MISMATCH'
+        : 'SP_API_FORBIDDEN'
+      : error.status === 429
+      ? 'RATE_LIMITED'
+      : error.status === 400
+      ? 'PRICING_BAD_REQUEST'
+      : error.code || amazonErrorCode || 'PRICING_API_ERROR';
+  wrapped.amazonErrorCode = amazonErrorCode;
+  wrapped.amazonErrorMessage = amazonErrorMessage;
+  wrapped.amazonErrorDetails = amazonErrorDetails;
+  wrapped.marketplaceId = marketplaceId;
+  wrapped.environment = client?.isSandbox !== false ? 'sandbox' : 'production';
+  wrapped.region = client?.region || 'eu';
+  wrapped.operation = operation;
+  wrapped.diagnostics = diagnostics;
+  wrapped.executionOutcome = AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE;
+  return wrapped;
+};
+
 /**
  * Get pricing and offers for an Item by ASIN using Product Pricing API v0
- * Read-only operation.
+ * Strictly read-only operation. Preserves India marketplace A21TJRUUN4KGV & INR currency mapping.
  *
  * @param {import('./amazon.client.js').AmazonSpApiClient} client
  * @param {string} asin
@@ -33,7 +73,10 @@ const withDbTimeout = (promise, ms = 2000) => {
  */
 export const getItemOffers = async (client, asin, options = {}) => {
   if (!asin || !asin.trim()) {
-    throw new Error('ASIN is required to fetch item pricing offers.');
+    const err = new Error('ASIN is required to fetch item pricing offers.');
+    err.code = 'INVALID_ASIN';
+    err.status = 400;
+    throw err;
   }
 
   const cleanAsin = asin.trim().toUpperCase();
@@ -44,22 +87,46 @@ export const getItemOffers = async (client, asin, options = {}) => {
     MarketplaceId: marketplaceId,
     ItemCondition: itemCondition,
   });
+  if (options.customerType) {
+    queryParams.set('CustomerType', String(options.customerType).trim());
+  }
 
   const endpointPath = `/products/pricing/v0/items/${encodeURIComponent(cleanAsin)}/offers?${queryParams.toString()}`;
-  const responseData = await client.executeRequest(endpointPath);
 
-  const payload = responseData.payload || responseData;
-  return mapAmazonOffersToPricing(payload, {
-    marketplaceId,
-    asin: cleanAsin,
-    title: options.title || '',
-    sku: options.sku || '',
-  });
+  try {
+    const responseData = await client.executeRequest(endpointPath, {
+      method: 'GET',
+      operation: 'getItemOffers',
+    });
+
+    const payload = responseData?.payload || responseData;
+    const mapped = mapAmazonOffersToPricing(payload, {
+      marketplaceId,
+      asin: cleanAsin,
+      title: options.title || '',
+      sku: options.sku || '',
+    });
+    const diagnostics =
+      typeof client.getLastRequestDiagnostics === 'function'
+        ? client.getLastRequestDiagnostics()
+        : responseData?._metadata || null;
+
+    return {
+      ...mapped,
+      diagnostics,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+    };
+  } catch (error) {
+    throw wrapPricingApiError(error, client, {
+      marketplaceId,
+      operation: 'getItemOffers',
+    });
+  }
 };
 
 /**
  * Get pricing and offers for a seller's listing by SKU using Product Pricing API v0
- * Read-only operation.
+ * Strictly read-only operation. Preserves India marketplace A21TJRUUN4KGV & INR currency mapping.
  *
  * @param {import('./amazon.client.js').AmazonSpApiClient} client
  * @param {string} sku
@@ -68,7 +135,10 @@ export const getItemOffers = async (client, asin, options = {}) => {
  */
 export const getListingOffers = async (client, sku, options = {}) => {
   if (!sku || !sku.trim()) {
-    throw new Error('Seller SKU is required to fetch listing pricing offers.');
+    const err = new Error('Seller SKU is required to fetch listing pricing offers.');
+    err.code = 'INVALID_SKU';
+    err.status = 400;
+    throw err;
   }
 
   const cleanSku = sku.trim();
@@ -79,17 +149,41 @@ export const getListingOffers = async (client, sku, options = {}) => {
     MarketplaceId: marketplaceId,
     ItemCondition: itemCondition,
   });
+  if (options.customerType) {
+    queryParams.set('CustomerType', String(options.customerType).trim());
+  }
 
   const endpointPath = `/products/pricing/v0/listings/${encodeURIComponent(cleanSku)}/offers?${queryParams.toString()}`;
-  const responseData = await client.executeRequest(endpointPath);
 
-  const payload = responseData.payload || responseData;
-  return mapAmazonOffersToPricing(payload, {
-    marketplaceId,
-    sku: cleanSku,
-    asin: options.asin || payload.ASIN || '',
-    title: options.title || '',
-  });
+  try {
+    const responseData = await client.executeRequest(endpointPath, {
+      method: 'GET',
+      operation: 'getListingOffers',
+    });
+
+    const payload = responseData?.payload || responseData;
+    const mapped = mapAmazonOffersToPricing(payload, {
+      marketplaceId,
+      sku: cleanSku,
+      asin: options.asin || payload?.ASIN || '',
+      title: options.title || '',
+    });
+    const diagnostics =
+      typeof client.getLastRequestDiagnostics === 'function'
+        ? client.getLastRequestDiagnostics()
+        : responseData?._metadata || null;
+
+    return {
+      ...mapped,
+      diagnostics,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+    };
+  } catch (error) {
+    throw wrapPricingApiError(error, client, {
+      marketplaceId,
+      operation: 'getListingOffers',
+    });
+  }
 };
 
 /**
