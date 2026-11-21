@@ -40,7 +40,15 @@ const channelConnectionSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['PENDING', 'CONNECTED', 'SYNCING', 'ERROR', 'DISCONNECTED', 'REAUTH_REQUIRED'],
+      enum: [
+        'PENDING',
+        'CONNECTED',
+        'SANDBOX_TRANSPORT_VERIFIED',
+        'SYNCING',
+        'ERROR',
+        'DISCONNECTED',
+        'REAUTH_REQUIRED',
+      ],
       default: 'PENDING',
     },
     displayName: {
@@ -75,6 +83,31 @@ const channelConnectionSchema = new mongoose.Schema(
       default: null,
     },
     tokenUpdatedAt: {
+      type: Date,
+      default: null,
+    },
+    lwaVerified: {
+      type: Boolean,
+      default: false,
+    },
+    sandboxTransportVerified: {
+      type: Boolean,
+      default: false,
+    },
+    sellerAuthorizationVerified: {
+      type: Boolean,
+      default: false,
+    },
+    indiaMarketplaceAuthorized: {
+      type: Boolean,
+      default: false,
+    },
+    verificationMode: {
+      type: String,
+      enum: ['REAL_SELLER_AUTHORIZED', 'SANDBOX_STATIC_MOCK', 'UNKNOWN', 'FAILED', null],
+      default: null,
+    },
+    lastVerifiedAt: {
       type: Date,
       default: null,
     },

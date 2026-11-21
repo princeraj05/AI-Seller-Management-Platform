@@ -150,7 +150,21 @@ export const searchAmazonCatalogApi = async (params = {}) => {
     return response.data;
   } catch (error) {
     if (error.response && error.response.data) {
-      throw new Error(error.response.data.message || 'Failed to search Amazon catalog');
+      const data = error.response.data;
+      const err = new Error(data.message || 'Failed to search Amazon catalog');
+      err.status = error.response.status;
+      err.code = data.code || data.errors?.code || null;
+      err.errorCategory = data.errors?.errorCategory || null;
+      err.amazonErrorCode = data.errors?.amazonErrorCode || null;
+      err.amazonErrorMessage = data.errors?.amazonErrorMessage || null;
+      err.amazonErrorDetails = data.errors?.amazonErrorDetails || null;
+      err.sandboxStaticNoMatch = Boolean(data.errors?.sandboxStaticNoMatch);
+      err.sandboxCompatibility = data.errors?.sandboxCompatibility || null;
+      err.marketplaceId = data.errors?.marketplaceId || null;
+      err.environment = data.errors?.environment || null;
+      err.diagnostics = data.errors?.diagnostics || null;
+      err.executionOutcome = data.errors?.executionOutcome || null;
+      throw err;
     }
     throw new Error(error.message || 'Network error searching Amazon catalog');
   }

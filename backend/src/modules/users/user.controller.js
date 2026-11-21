@@ -1,11 +1,15 @@
+import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { User } from './user.model.js';
 import { Store } from '../onboarding/store.model.js';
 import { RefreshToken } from './refreshToken.model.js';
+import { PasswordResetToken } from './passwordResetToken.model.js';
 import { adminAuth } from '../../config/firebase.js';
+import { sendNotificationEmailService } from '../../services/email/email.service.js';
 import {
   generateAccessToken,
   generateRefreshToken,
+  verifyAccessToken,
   verifyRefreshToken,
   hashToken,
   setRefreshTokenCookie,
@@ -65,7 +69,7 @@ export const loginWithGoogle = async (req, res) => {
       });
     }
 
-    const { uid, email, name, picture } = decodedToken;
+    const { uid, email, name, picture, email_verified: emailVerified } = decodedToken;
 
     if (!email) {
       return res.status(400).json({
@@ -77,26 +81,41 @@ export const loginWithGoogle = async (req, res) => {
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Find or auto-provision user in MongoDB
-    let user = await User.findOne({
-      $or: [{ firebaseUid: uid }, { email: normalizedEmail }],
-    });
+    // First look up by already-linked Firebase UID
+    let user = await User.findOne({ firebaseUid: uid });
 
     if (!user) {
-      user = await User.create({
-        firebaseUid: uid,
-        email: normalizedEmail,
-        name: name || normalizedEmail.split('@')[0],
-        avatar: picture || '',
-        role: 'seller',
-        isActive: true,
-      });
+      // Never link or provision an account by email unless Firebase confirms email_verified === true
+      if (emailVerified !== true) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your Google/Firebase email address must be verified before signing in or linking accounts.',
+          code: 'EMAIL_NOT_VERIFIED',
+        });
+      }
+
+      user = await User.findOne({ email: normalizedEmail });
+      if (!user) {
+        user = await User.create({
+          firebaseUid: uid,
+          email: normalizedEmail,
+          name: name || normalizedEmail.split('@')[0],
+          avatar: picture || '',
+          role: 'seller',
+          isActive: true,
+        });
+      } else {
+        user.firebaseUid = uid;
+        if (name && (!user.name || user.name === 'Prince Admin' || user.name === 'Seller')) {
+          user.name = name;
+        }
+        if (picture && user.avatar !== picture) {
+          user.avatar = picture;
+        }
+        await user.save();
+      }
     } else {
       let shouldSave = false;
-      if (!user.firebaseUid) {
-        user.firebaseUid = uid;
-        shouldSave = true;
-      }
       if (name && (!user.name || user.name === 'Prince Admin' || user.name === 'Seller')) {
         user.name = name;
         shouldSave = true;
@@ -458,13 +477,159 @@ export const logoutUser = async (req, res) => {
 };
 
 /**
- * @desc    Reset password (with bcrypt hashing) for migration or credential update
+ * Helper: Attempt to authenticate an optional Bearer token for password-change/recovery verification
+ * Returns the verified identity { userId, firebaseUid, email, emailVerified } or null.
+ */
+const resolveVerifiedResetSession = async (req) => {
+  if (req.user && req.user.id) {
+    return {
+      userId: req.user.id.toString(),
+      firebaseUid: req.user.firebaseUid || null,
+      email: req.user.email ? req.user.email.toLowerCase().trim() : null,
+      emailVerified: true,
+    };
+  }
+
+  const authHeader = req.headers?.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) return null;
+
+  // 1. Try Firebase ID token (enables verified Google OAuth recovery / setting local password)
+  if (adminAuth) {
+    try {
+      const decodedFb = await adminAuth.verifyIdToken(token);
+      if (decodedFb && decodedFb.uid) {
+        return {
+          userId: null,
+          firebaseUid: decodedFb.uid,
+          email: decodedFb.email ? decodedFb.email.toLowerCase().trim() : null,
+          emailVerified: decodedFb.email_verified === true,
+        };
+      }
+    } catch {
+      // Not a Firebase token; try platform JWT below
+    }
+  }
+
+  // 2. Try cryptographic platform access JWT
+  try {
+    const decoded = verifyAccessToken(token);
+    if (decoded && decoded.type === 'access' && decoded.sub) {
+      const sessionUser = await User.findById(decoded.sub);
+      if (
+        sessionUser &&
+        sessionUser.isActive !== false &&
+        (decoded.tokenVersion === undefined || decoded.tokenVersion === (sessionUser.tokenVersion || 0))
+      ) {
+        return {
+          userId: sessionUser._id.toString(),
+          firebaseUid: sessionUser.firebaseUid || null,
+          email: sessionUser.email ? sessionUser.email.toLowerCase().trim() : null,
+          emailVerified: true,
+        };
+      }
+    }
+  } catch {
+    // Invalid or expired JWT
+  }
+
+  return null;
+};
+
+/**
+ * Constant-time plaintext comparison helper for legacy password migration
+ */
+const safePlaintextCompare = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+};
+
+/**
+ * @desc    Request a single-use, time-limited password reset token (supports local & Google OAuth recovery)
+ * @route   POST /api/auth/request-password-reset
+ * @access  Public (Rate-limited; uniform response prevents email enumeration)
+ */
+export const requestPasswordReset = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid email address is required',
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const uniformMessage =
+      'If an account with that email exists, a password reset verification code has been issued.';
+
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        message: 'Authentication service is temporarily unavailable. Please try again later.',
+        code: 'DB_UNAVAILABLE',
+      });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (user && user.isActive !== false) {
+      // Invalidate previous unused tokens for this user
+      await PasswordResetToken.updateMany(
+        { userId: user._id, isUsed: false },
+        { $set: { isUsed: true } }
+      );
+
+      const rawResetToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashToken(rawResetToken);
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+      await PasswordResetToken.create({
+        userId: user._id,
+        email: normalizedEmail,
+        tokenHash,
+        isUsed: false,
+        expiresAt,
+      });
+
+      try {
+        await sendNotificationEmailService(normalizedEmail, 'PASSWORD_RESET', {
+          name: user.name,
+          resetToken: rawResetToken,
+          expiresInMinutes: 15,
+        });
+      } catch (mailErr) {
+        console.warn('Password reset email dispatch failed:', mailErr.message);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: uniformMessage,
+    });
+  } catch (error) {
+    console.error('Request password reset error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to process password reset request',
+    });
+  }
+};
+
+/**
+ * @desc    Reset or update password (requires verified resetToken, verified authenticated session, or verified currentPassword)
  * @route   POST /api/auth/reset-password
- * @access  Public
+ * @access  Protected by reset token, verified Bearer session, or currentPassword proof
  */
 export const resetPassword = async (req, res) => {
   try {
-    const { email, currentPassword, newPassword } = req.body;
+    const { email, currentPassword, newPassword, resetToken } = req.body;
 
     if (!email || !newPassword) {
       return res.status(400).json({
@@ -473,7 +638,7 @@ export const resetPassword = async (req, res) => {
       });
     }
 
-    if (newPassword.length < 8) {
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
       return res.status(400).json({
         success: false,
         message: 'New password must be at least 8 characters long',
@@ -483,36 +648,109 @@ export const resetPassword = async (req, res) => {
     const normalizedEmail = email.toLowerCase().trim();
     const user = await User.findOne({ email: normalizedEmail }).select('+password');
 
-    if (!user) {
-      return res.status(404).json({
+    // Avoid email enumeration when unauthenticated
+    if (!user || user.isActive === false) {
+      return res.status(401).json({
         success: false,
-        message: 'User account not found',
+        message: 'Invalid credentials or password reset verification failed.',
+        code: 'RESET_VERIFICATION_FAILED',
       });
     }
 
-    // If account has an existing bcrypt password, require current password verification
-    if (user.password && (user.password.startsWith('$2a$') || user.password.startsWith('$2b$'))) {
-      if (!currentPassword) {
-        return res.status(400).json({
-          success: false,
-          message: 'Current password is required to update password',
-        });
-      }
-      const isMatch = await user.comparePassword(currentPassword);
-      if (!isMatch) {
+    const hasBcryptPassword = Boolean(
+      user.password && (user.password.startsWith('$2a$') || user.password.startsWith('$2b$'))
+    );
+    const hasLegacyPassword = Boolean(user.password && !hasBcryptPassword);
+    const isGoogleOnlyAccount = !user.password;
+
+    let verifiedByResetToken = false;
+    let verifiedBySession = false;
+
+    // Path 1: Verified single-use reset token (atomic consumption)
+    if (resetToken && typeof resetToken === 'string' && resetToken.trim()) {
+      const tokenHash = hashToken(resetToken.trim());
+      const consumedToken = await PasswordResetToken.findOneAndUpdate(
+        {
+          userId: user._id,
+          email: normalizedEmail,
+          tokenHash,
+          isUsed: false,
+          expiresAt: { $gt: new Date() },
+        },
+        { $set: { isUsed: true } },
+        { new: true }
+      );
+
+      if (!consumedToken) {
         return res.status(401).json({
           success: false,
-          message: 'Current password does not match',
+          message: 'Invalid or expired password reset token.',
+          code: 'INVALID_RESET_TOKEN',
         });
+      }
+      verifiedByResetToken = true;
+    }
+
+    // Path 2: Verified authenticated session (platform JWT or verified Google/Firebase ID token)
+    if (!verifiedByResetToken) {
+      const sessionIdentity = await resolveVerifiedResetSession(req);
+      if (sessionIdentity) {
+        const matchesUserId = sessionIdentity.userId && sessionIdentity.userId === user._id.toString();
+        const matchesFirebaseUid =
+          sessionIdentity.firebaseUid && user.firebaseUid && sessionIdentity.firebaseUid === user.firebaseUid;
+        const matchesVerifiedEmail =
+          sessionIdentity.emailVerified === true && sessionIdentity.email === normalizedEmail;
+
+        if (matchesUserId || matchesFirebaseUid || matchesVerifiedEmail) {
+          verifiedBySession = true;
+        }
       }
     }
-    // If account has a legacy plaintext password and currentPassword was supplied, verify it
-    else if (user.password && currentPassword) {
-      if (user.password !== currentPassword) {
-        return res.status(401).json({
-          success: false,
-          message: 'Current password does not match',
-        });
+
+    // Enforce strict authorization proof — NEVER allow unauthenticated password overwrite
+    if (!verifiedByResetToken) {
+      if (isGoogleOnlyAccount) {
+        // Google OAuth account recovery requires either a verified resetToken OR a verified Google/JWT session for this user
+        if (!verifiedBySession) {
+          return res.status(401).json({
+            success: false,
+            message:
+              'Verification required: Please sign in with Google or request a verified password reset token to set a password for this account.',
+            code: 'RESET_AUTH_REQUIRED',
+          });
+        }
+      } else if (hasBcryptPassword) {
+        if (!currentPassword || typeof currentPassword !== 'string') {
+          return res.status(401).json({
+            success: false,
+            message: 'Current password or a verified reset token is required to update password.',
+            code: 'CURRENT_PASSWORD_REQUIRED',
+          });
+        }
+        const isMatch = await user.comparePassword(currentPassword);
+        if (!isMatch) {
+          return res.status(401).json({
+            success: false,
+            message: 'Current password does not match.',
+            code: 'INVALID_CURRENT_PASSWORD',
+          });
+        }
+      } else if (hasLegacyPassword) {
+        // Legacy plaintext migration MUST verify currentPassword (or verified resetToken above)
+        if (!currentPassword || typeof currentPassword !== 'string') {
+          return res.status(401).json({
+            success: false,
+            message: 'Current password or a verified reset token is required to upgrade your password.',
+            code: 'CURRENT_PASSWORD_REQUIRED',
+          });
+        }
+        if (!safePlaintextCompare(user.password, currentPassword)) {
+          return res.status(401).json({
+            success: false,
+            message: 'Current password does not match.',
+            code: 'INVALID_CURRENT_PASSWORD',
+          });
+        }
       }
     }
 
@@ -522,8 +760,9 @@ export const resetPassword = async (req, res) => {
     user.tokenVersion = (user.tokenVersion || 0) + 1; // Invalidate all prior sessions
     await user.save();
 
-    // Revoke all existing refresh tokens for this user
+    // Revoke all existing refresh tokens & unused reset tokens for this user
     await RefreshToken.updateMany({ userId: user._id }, { $set: { isRevoked: true } });
+    await PasswordResetToken.updateMany({ userId: user._id, isUsed: false }, { $set: { isUsed: true } });
 
     clearRefreshTokenCookie(res);
 
@@ -532,10 +771,82 @@ export const resetPassword = async (req, res) => {
       message: 'Password updated and hashed successfully. Please sign in with your new password.',
     });
   } catch (error) {
-    console.error('Reset password error:', error);
+    console.error('Reset password error:', error.message);
     return res.status(500).json({
       success: false,
-      message: error.message || 'Server error during password reset',
+      message: 'Server error during password reset',
+    });
+  }
+};
+
+/**
+ * @desc    Authenticated password change (or local password setup for signed-in Google OAuth sellers)
+ * @route   POST /api/auth/change-password
+ * @access  Private (authMiddleware)
+ */
+export const changePassword = async (req, res) => {
+  try {
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required to change password.',
+        code: 'UNAUTHENTICATED',
+      });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters long',
+      });
+    }
+
+    const user = await User.findById(req.user.id).select('+password');
+    if (!user || user.isActive === false) {
+      return res.status(404).json({
+        success: false,
+        message: 'User account not found',
+      });
+    }
+
+    if (user.password) {
+      if (!currentPassword || typeof currentPassword !== 'string') {
+        return res.status(400).json({
+          success: false,
+          message: 'Current password is required to change your password.',
+        });
+      }
+      const isBcrypt = user.password.startsWith('$2a$') || user.password.startsWith('$2b$');
+      const valid = isBcrypt
+        ? await user.comparePassword(currentPassword)
+        : safePlaintextCompare(user.password, currentPassword);
+
+      if (!valid) {
+        return res.status(401).json({
+          success: false,
+          message: 'Current password does not match.',
+        });
+      }
+    }
+
+    user.password = newPassword;
+    user.mustResetPassword = false;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
+    await user.save();
+
+    await RefreshToken.updateMany({ userId: user._id }, { $set: { isRevoked: true } });
+    clearRefreshTokenCookie(res);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password updated successfully. Please sign in again.',
+    });
+  } catch (error) {
+    console.error('Change password error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error during password change',
     });
   }
 };

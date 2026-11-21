@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { config } from '../../config/env.js';
 import { validateConnectChannelInput } from './channel.validator.js';
 import {
   connectChannelService,
@@ -15,6 +16,7 @@ import {
   disconnectAmazonService,
   testAmazonConnectionService,
   buildTenantConnectionQuery,
+  matchesTenantStore,
   inMemoryChannelsMap,
   inMemoryListingsMap,
 } from './channel.service.js';
@@ -23,6 +25,9 @@ import { MarketplaceListing } from './marketplaceListing.model.js';
 import { MarketplaceInventory } from './marketplaceInventory.model.js';
 import { MarketplacePricing } from './marketplacePricing.model.js';
 import { decryptCredentials } from '../../utils/encryption.js';
+import {
+  SANDBOX_STATIC_MOCK_MESSAGE,
+} from '../../integrations/marketplaces/amazon/amazon.sellers.service.js';
 import { AmazonSpApiClient } from '../../integrations/marketplaces/amazon/amazon.client.js';
 import {
   searchCatalogItems,
@@ -182,6 +187,41 @@ export const getChannelHealth = async (req, res) => {
   }
 };
 
+const SANITIZED_OAUTH_ERROR_CODES = new Set([
+  'MISSING_STATE',
+  'MISSING_OAUTH_CODE',
+  'INVALID_OAUTH_STATE',
+  'OAUTH_STATE_EXPIRED',
+  'OAUTH_STATE_REPLAY',
+  'OAUTH_STATE_STORE_UNAVAILABLE',
+  'CROSS_TENANT_STATE_MISMATCH',
+  'LWA_EXCHANGE_FAILED',
+  'LWA_UNAUTHORIZED',
+  'SP_API_FORBIDDEN',
+  'RATE_LIMITED',
+  'EMPTY_MARKETPLACE_PARTICIPATIONS',
+  'MARKETPLACE_NOT_AUTHORIZED',
+  'SELLER_VERIFICATION_FAILED',
+  'NETWORK_FAILURE',
+  'SERVICE_UNAVAILABLE',
+]);
+
+const resolveFrontendOrigin = () =>
+  (process.env.CLIENT_URL || config.clientUrl || 'http://localhost:3000').trim().replace(/\/+$/, '');
+
+const resolveSanitizedOAuthErrorCode = (error) => {
+  if (error?.code && SANITIZED_OAUTH_ERROR_CODES.has(error.code)) {
+    return error.code;
+  }
+  const msg = String(error?.message || '').toLowerCase();
+  if (msg.includes('expired')) return 'OAUTH_STATE_EXPIRED';
+  if (msg.includes('replay') || msg.includes('already been consumed')) return 'OAUTH_STATE_REPLAY';
+  if (msg.includes('cross-tenant') || msg.includes('mismatch')) return 'CROSS_TENANT_STATE_MISMATCH';
+  if (msg.includes('spapi_oauth_code')) return 'MISSING_OAUTH_CODE';
+  if (msg.includes('state')) return 'INVALID_OAUTH_STATE';
+  return 'OAUTH_CALLBACK_FAILED';
+};
+
 /**
  * Initiate Amazon OAuth authorization
  */
@@ -190,53 +230,81 @@ export const initiateAmazonOAuth = async (req, res) => {
     const result = await getAmazonOAuthUrlService(req.tenant, req.query);
     return successResponse(res, 200, 'Amazon OAuth URL generated successfully', result);
   } catch (error) {
-    console.error('Initiate Amazon OAuth Error:', error);
-    return errorResponse(res, 400, error.message || 'Failed to initiate Amazon OAuth');
+    console.error('Initiate Amazon OAuth Error:', error.code || error.message);
+    return errorResponse(res, error.status || 400, error.message || 'Failed to initiate Amazon OAuth');
   }
 };
 
 /**
- * Handle Amazon OAuth callback from Seller Central
+ * Handle Amazon OAuth callback from Seller Central.
+ * - GET (browser redirect): public route; tenant identity is bound strictly from signed single-use state
+ *   and redirects to configured CLIENT_URL with sanitized status/code only.
+ * - POST (authenticated API): cross-checks state tenantId against req.tenant.sellerId and returns JSON.
  */
 export const handleAmazonOAuthCallback = async (req, res) => {
+  const isBrowserRedirect =
+    req.method === 'GET' &&
+    (!req.headers.accept || req.headers.accept.includes('text/html') || !req.headers.accept.includes('application/json'));
+  const frontendBase = resolveFrontendOrigin();
+
   try {
     const params = { ...req.query, ...req.body };
-    const channel = await handleAmazonOAuthCallbackService(req.tenant, params);
+    const tenantContext = req.tenant || null;
+    const channel = await handleAmazonOAuthCallbackService(tenantContext, params);
+    const isSandboxTransportOnly = channel?.status === 'SANDBOX_TRANSPORT_VERIFIED';
 
-    // If browser request, can redirect to frontend
-    if (req.headers.accept && req.headers.accept.includes('text/html')) {
-      return res.redirect('/channels/amazon?status=connected');
+    if (isBrowserRedirect) {
+      const statusParam = isSandboxTransportOnly ? 'sandbox_transport_verified' : 'connected';
+      return res.redirect(`${frontendBase}/channels/amazon?status=${statusParam}`);
     }
 
-    return successResponse(res, 200, 'Amazon account connected successfully via OAuth', { channel });
+    const msg = isSandboxTransportOnly
+      ? SANDBOX_STATIC_MOCK_MESSAGE
+      : 'Amazon account connected and verified successfully via OAuth';
+    return successResponse(res, 200, msg, { channel });
   } catch (error) {
-    console.error('Amazon OAuth Callback Error:', error);
-    if (req.headers.accept && req.headers.accept.includes('text/html')) {
-      return res.redirect(`/channels/amazon?status=error&message=${encodeURIComponent(error.message)}`);
+    const sanitizedCode = resolveSanitizedOAuthErrorCode(error);
+    console.error('Amazon OAuth Callback Error:', sanitizedCode);
+
+    if (isBrowserRedirect) {
+      return res.redirect(`${frontendBase}/channels/amazon?status=error&code=${encodeURIComponent(sanitizedCode)}`);
     }
-    return errorResponse(res, 400, error.message || 'Amazon OAuth callback processing failed');
+
+    return errorResponse(
+      res,
+      error.status || 400,
+      error.publicMessage || 'Amazon OAuth authorization could not be completed.',
+      { code: sanitizedCode }
+    );
   }
 };
 
 /**
- * Connect Amazon via Sandbox Self-Authorization (LWA Refresh Token)
+ * Connect Amazon via Sandbox Self-Authorization (LWA Refresh Token + Sellers API Verification)
  */
 export const connectAmazonManual = async (req, res) => {
   try {
-    const { refreshToken, sellingPartnerId } = req.body;
+    const { refreshToken } = req.body;
     if (!refreshToken) {
       return errorResponse(res, 400, 'LWA Refresh Token is required');
     }
 
     const channel = await connectAmazonManualService(req.tenant, req.body);
-    return successResponse(res, 201, 'Amazon account connected successfully via Sandbox Self-Authorization', {
+    const isSandboxTransportOnly = channel?.status === 'SANDBOX_TRANSPORT_VERIFIED';
+    const message = isSandboxTransportOnly
+      ? SANDBOX_STATIC_MOCK_MESSAGE
+      : 'Amazon account connected and verified via Sandbox Self-Authorization';
+    return successResponse(res, 201, message, {
       channel,
       connection: channel,
       data: { channel, connection: channel },
     });
   } catch (error) {
-    console.error('Connect Amazon Manual Error:', error);
-    return errorResponse(res, 400, error.message || 'Failed to connect Amazon account');
+    console.error('Connect Amazon Manual Error:', error.code || error.message);
+    return errorResponse(res, error.status || 400, error.message || 'Failed to connect Amazon account', {
+      code: error.code || 'CONNECT_FAILED',
+      diagnostics: error.diagnostics || null,
+    });
   }
 };
 
@@ -245,14 +313,14 @@ export const connectAmazonManual = async (req, res) => {
  */
 export const getAmazonConnectionStatus = async (req, res) => {
   try {
-    const status = await getAmazonConnectionStatusService(req.tenant.sellerId);
+    const status = await getAmazonConnectionStatusService(req.tenant);
     return successResponse(res, 200, 'Amazon connection status fetched successfully', {
       connection: status,
       data: { connection: status },
     });
   } catch (error) {
-    console.error('Get Amazon Status Error:', error);
-    return errorResponse(res, 500, error.message || 'Failed to fetch Amazon connection status');
+    console.error('Get Amazon Status Error:', error.code || error.message);
+    return errorResponse(res, error.status || 500, error.message || 'Failed to fetch Amazon connection status');
   }
 };
 
@@ -261,49 +329,60 @@ export const getAmazonConnectionStatus = async (req, res) => {
  */
 export const disconnectAmazon = async (req, res) => {
   try {
-    const channel = await disconnectAmazonService(req.tenant.sellerId);
+    const channel = await disconnectAmazonService(req.tenant);
     return successResponse(res, 200, 'Amazon channel disconnected successfully', { channel });
   } catch (error) {
-    console.error('Disconnect Amazon Error:', error);
-    return errorResponse(res, 400, error.message || 'Failed to disconnect Amazon');
+    console.error('Disconnect Amazon Error:', error.code || error.message);
+    return errorResponse(res, error.status || 400, error.message || 'Failed to disconnect Amazon');
   }
 };
 
 /**
- * Test Amazon connection live against SP-API LWA
+ * Test Amazon connection live against SP-API LWA + Sellers API (cache-bypassing)
  */
 export const testAmazonConnection = async (req, res) => {
   try {
-    const result = await testAmazonConnectionService(req.tenant.sellerId);
+    const result = await testAmazonConnectionService(req.tenant);
     return successResponse(res, 200, 'Amazon connection test completed', result);
   } catch (error) {
-    console.error('Test Amazon Connection Error:', error);
-    return errorResponse(res, 400, error.message || 'Amazon connection test failed');
+    console.error('Test Amazon Connection Error:', error.code || error.message);
+    return errorResponse(res, error.status || 400, error.message || 'Amazon connection test failed');
   }
 };
 
 /**
- * Helper to obtain an authenticated AmazonSpApiClient for a verified tenant
+ * Helper to obtain an authenticated AmazonSpApiClient for a verified tenant (sellerId + storeId scoped)
  */
-const getAmazonClientForTenant = async (sellerId) => {
+const getAmazonClientForTenant = async (tenantInput) => {
+  const sellerId = typeof tenantInput === 'object' && tenantInput !== null ? tenantInput.sellerId : tenantInput;
+  const storeId = typeof tenantInput === 'object' && tenantInput !== null ? tenantInput.storeId || null : null;
+
   let connection = null;
   try {
-    const query = buildTenantConnectionQuery(sellerId, 'AMAZON');
+    const query = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
     connection = await ChannelConnection.findOne(query);
   } catch (e) {
-    // fallback
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to load Amazon channel connection from MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
   }
 
-  if (!connection) {
-    const sellerIdStr = sellerId ? sellerId.toString() : '';
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
       (c) =>
-        (c.sellerId?.toString() === sellerIdStr || c.tenantId?.toString() === sellerIdStr) &&
+        matchesTenantStore(c, { sellerId, storeId }) &&
         (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
 
-  if (!connection || connection.status !== 'CONNECTED' || !connection.credentials) {
+  const isAllowedSandboxTransport =
+    connection?.status === 'SANDBOX_TRANSPORT_VERIFIED' &&
+    (connection?.environment || config.amazon?.env || 'sandbox') === 'sandbox';
+
+  if (!connection || (connection.status !== 'CONNECTED' && !isAllowedSandboxTransport) || !connection.credentials) {
     const err = new Error('Active Amazon channel connection is required. Please authorize Amazon first.');
     err.code = 'AMAZON_NOT_CONNECTED';
     err.status = 400;
@@ -319,9 +398,12 @@ const getAmazonClientForTenant = async (sellerId) => {
   }
 
   const client = new AmazonSpApiClient({
+    sellerId: sellerId ? sellerId.toString() : null,
+    sellingPartnerId: connection.sellingPartnerId || connection.externalAccountId || decrypted.sellingPartnerId || null,
     refreshToken: decrypted.refreshToken,
     region: connection.marketplaceRegion || 'eu',
     marketplaceId: connection.marketplaceId || 'A21TJRUUN4KGV',
+    sandbox: (connection.environment || config.amazon?.env || 'sandbox') === 'sandbox',
   });
 
   const sellingPartnerId = connection.sellingPartnerId || connection.externalAccountId || decrypted.sellingPartnerId;
@@ -339,19 +421,77 @@ const getAmazonClientForTenant = async (sellerId) => {
  */
 export const searchAmazonCatalog = async (req, res) => {
   try {
-    const { keywords, identifiers, identifiersType } = req.query;
-    if (!keywords && !identifiers) {
-      return errorResponse(res, 400, 'Search requires either keywords or identifiers query parameter.');
+    const {
+      keywords,
+      identifiers,
+      identifiersType,
+      marketplaceIds,
+      includedData,
+      pageSize,
+      pageToken,
+    } = req.query;
+
+    const hasKeywords = typeof keywords === 'string' && keywords.trim().length > 0;
+    const hasIdentifiers = typeof identifiers === 'string' && identifiers.trim().length > 0;
+
+    if (!hasKeywords && !hasIdentifiers) {
+      return errorResponse(
+        res,
+        400,
+        'Search requires either non-empty keywords or identifiers query parameter.',
+        null,
+        'INVALID_CATALOG_QUERY'
+      );
     }
 
-    const { client } = await getAmazonClientForTenant(req.tenant.sellerId);
-    const results = await searchCatalogItems(client, req.query);
+    if (hasKeywords && hasIdentifiers) {
+      return errorResponse(
+        res,
+        400,
+        'Amazon Catalog Items API v2022-04-01 does not allow both keywords and identifiers in the same request.',
+        null,
+        'MUTUALLY_EXCLUSIVE_PARAMS'
+      );
+    }
+
+    const { client, sellingPartnerId } = await getAmazonClientForTenant(req.tenant);
+    const results = await searchCatalogItems(client, {
+      keywords: hasKeywords ? keywords : undefined,
+      identifiers: hasIdentifiers ? identifiers : undefined,
+      identifiersType,
+      marketplaceIds,
+      includedData,
+      pageSize,
+      pageToken,
+      sellingPartnerId,
+    });
 
     return successResponse(res, 200, 'Amazon catalog items retrieved successfully', results);
   } catch (error) {
-    console.error('Search Amazon Catalog Error:', error);
+    console.error(
+      `Search Amazon Catalog Error: code=${error.code || 'ERROR'} status=${error.status || 500} requestId=${error.diagnostics?.requestId || 'N/A'}`
+    );
     const status = error.status || (error.code === 'AMAZON_NOT_CONNECTED' ? 400 : 500);
-    return errorResponse(res, status, error.message || 'Failed to search Amazon catalog');
+    return errorResponse(
+      res,
+      status,
+      error.message || 'Failed to search Amazon catalog',
+      {
+        code: error.code || 'CATALOG_SEARCH_FAILED',
+        errorCategory: error.errorCategory || 'API_FAILURE',
+        amazonErrorCode: error.amazonErrorCode || null,
+        amazonErrorMessage: error.amazonErrorMessage || null,
+        amazonErrorDetails: error.amazonErrorDetails || null,
+        sandboxStaticNoMatch: Boolean(error.sandboxStaticNoMatch),
+        sandboxCompatibility: error.sandboxCompatibility || null,
+        marketplaceId: error.marketplaceId || null,
+        environment: error.environment || null,
+        region: error.region || null,
+        diagnostics: error.diagnostics || null,
+        executionOutcome: error.executionOutcome || null,
+      },
+      error.code || 'CATALOG_SEARCH_FAILED'
+    );
   }
 };
 
@@ -363,17 +503,31 @@ export const getAmazonCatalogItemByAsin = async (req, res) => {
   try {
     const { asin } = req.params;
     if (!asin || !asin.trim()) {
-      return errorResponse(res, 400, 'Valid ASIN parameter is required.');
+      return errorResponse(res, 400, 'Valid ASIN parameter is required.', null, 'INVALID_ASIN');
     }
 
-    const { client } = await getAmazonClientForTenant(req.tenant.sellerId);
+    const { client } = await getAmazonClientForTenant(req.tenant);
     const item = await getCatalogItem(client, asin.trim(), req.query);
 
     return successResponse(res, 200, 'Amazon catalog item details retrieved', { item });
   } catch (error) {
-    console.error('Get Amazon Catalog Item Error:', error);
+    console.error(
+      `Get Amazon Catalog Item Error: code=${error.code || 'ERROR'} status=${error.status || 500} requestId=${error.diagnostics?.requestId || 'N/A'}`
+    );
     const status = error.status || (error.code === 'AMAZON_NOT_CONNECTED' ? 400 : 500);
-    return errorResponse(res, status, error.message || 'Failed to retrieve Amazon catalog item');
+    return errorResponse(
+      res,
+      status,
+      error.message || 'Failed to retrieve Amazon catalog item',
+      {
+        code: error.code || 'CATALOG_ITEM_FAILED',
+        amazonErrorCode: error.amazonErrorCode || null,
+        amazonErrorMessage: error.amazonErrorMessage || null,
+        sandboxStaticNoMatch: Boolean(error.sandboxStaticNoMatch),
+        diagnostics: error.diagnostics || null,
+      },
+      error.code || 'CATALOG_ITEM_FAILED'
+    );
   }
 };
 
@@ -382,13 +536,16 @@ export const getAmazonCatalogItemByAsin = async (req, res) => {
  */
 export const getAmazonListings = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    // Filter by sellerId, provider AMAZON, and optional search
+    // Filter by sellerId, storeId (when present), provider AMAZON, and optional search
     const query = { sellerId, provider: 'AMAZON' };
+    if (storeId) {
+      query.storeId = storeId.toString();
+    }
     if (req.query.status) {
       query.status = req.query.status.toUpperCase();
     }
@@ -406,9 +563,12 @@ export const getAmazonListings = async (req, res) => {
         MarketplaceListing.countDocuments(query),
       ]);
     } catch (dbErr) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon listings from MongoDB.');
+      }
       console.warn('DB listings lookup error, reading memory map:', dbErr.message);
       const memListings = Array.from(inMemoryListingsMap.values()).filter(
-        (l) => l.sellerId?.toString() === sellerId?.toString() && l.provider === 'AMAZON'
+        (l) => matchesTenantStore(l, { sellerId, storeId }) && l.provider === 'AMAZON'
       );
       total = memListings.length;
       listings = memListings.slice(skip, skip + limit);
@@ -434,7 +594,7 @@ export const getAmazonListings = async (req, res) => {
  */
 export const getAmazonListingBySku = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const { sku } = req.params;
 
     if (!sku || !sku.trim()) {
@@ -445,19 +605,38 @@ export const getAmazonListingBySku = async (req, res) => {
     let listing = null;
 
     try {
-      listing = await MarketplaceListing.findOne({
+      const listingQuery = {
         sellerId,
         provider: 'AMAZON',
         externalSku: cleanSku,
-      }).populate('productId', 'title sku masterPrice images stock');
+      };
+      if (storeId) {
+        listingQuery.storeId = storeId.toString();
+      }
+      listing = await MarketplaceListing.findOne(listingQuery).populate('productId', 'title sku masterPrice images stock');
     } catch (e) {
-      listing = inMemoryListingsMap.get(`list-${cleanSku}`);
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon listing from MongoDB.');
+      }
+      // Strictly tenant-scoped memory lookup (never unscoped `list-${sku}`)
+      const directScoped = inMemoryListingsMap.get(`${sellerId}:${cleanSku}`);
+      if (directScoped && matchesTenantStore(directScoped, { sellerId, storeId }) && directScoped.provider === 'AMAZON') {
+        listing = directScoped;
+      } else {
+        listing =
+          Array.from(inMemoryListingsMap.values()).find(
+            (l) =>
+              matchesTenantStore(l, { sellerId, storeId }) &&
+              l.provider === 'AMAZON' &&
+              l.externalSku === cleanSku
+          ) || null;
+      }
     }
 
     // If live query requested or not in DB, attempt live fetch via Listings Items API
     if (req.query.live === 'true' || !listing) {
       try {
-        const { client, sellingPartnerId, marketplaceId } = await getAmazonClientForTenant(sellerId);
+        const { client, sellingPartnerId, marketplaceId } = await getAmazonClientForTenant(req.tenant);
         const liveListing = await getListingsItem(client, sellingPartnerId, cleanSku, { marketplaceId });
         return successResponse(res, 200, 'Live Amazon listing item retrieved', { listing: liveListing, isLive: true });
       } catch (liveErr) {
@@ -511,12 +690,15 @@ export const getAmazonSyncStatus = async (req, res) => {
  */
 export const getAmazonInventory = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const query = { sellerId };
+    const query = { sellerId, provider: 'AMAZON' };
+    if (storeId) {
+      query.storeId = storeId.toString();
+    }
     if (req.query.fulfillmentChannel) {
       query.fulfillmentChannel = req.query.fulfillmentChannel.toUpperCase();
     }
@@ -534,8 +716,11 @@ export const getAmazonInventory = async (req, res) => {
         MarketplaceInventory.countDocuments(query),
       ]);
     } catch (e) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon inventory from MongoDB.');
+      }
       const memItems = Array.from(inMemoryInventoryMap.values()).filter(
-        (i) => i.sellerId?.toString() === sellerId?.toString()
+        (i) => matchesTenantStore(i, { sellerId, storeId }) && (!i.provider || i.provider === 'AMAZON')
       );
       total = memItems.length;
       items = memItems.slice(skip, skip + limit);
@@ -561,14 +746,22 @@ export const getAmazonInventory = async (req, res) => {
  */
 export const getAmazonInventoryBySku = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const { sku } = req.params;
 
     let item = null;
     try {
-      item = await MarketplaceInventory.findOne({ sellerId, externalSku: sku.trim() });
+      const query = { sellerId, provider: 'AMAZON', externalSku: sku.trim() };
+      if (storeId) query.storeId = storeId.toString();
+      item = await MarketplaceInventory.findOne(query);
     } catch (e) {
-      item = inMemoryInventoryMap.get(`${sellerId}_${sku.trim()}`);
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon inventory item from MongoDB.');
+      }
+      const candidate = inMemoryInventoryMap.get(`${sellerId}_${sku.trim()}`);
+      if (candidate && matchesTenantStore(candidate, { sellerId, storeId })) {
+        item = candidate;
+      }
     }
 
     if (!item) {
@@ -623,12 +816,15 @@ export const getAmazonInventoryStatus = async (req, res) => {
  */
 export const getAmazonPricing = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
     const skip = (page - 1) * limit;
 
-    const query = { sellerId };
+    const query = { sellerId, provider: 'AMAZON' };
+    if (storeId) {
+      query.storeId = storeId.toString();
+    }
     if (req.query.search) {
       const searchRegex = new RegExp(req.query.search.trim(), 'i');
       query.$or = [{ externalSku: searchRegex }, { asin: searchRegex }, { title: searchRegex }];
@@ -643,8 +839,11 @@ export const getAmazonPricing = async (req, res) => {
         MarketplacePricing.countDocuments(query),
       ]);
     } catch (e) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon pricing from MongoDB.');
+      }
       const memItems = Array.from(inMemoryPricingMap.values()).filter(
-        (p) => p.sellerId?.toString() === sellerId?.toString()
+        (p) => matchesTenantStore(p, { sellerId, storeId }) && (!p.provider || p.provider === 'AMAZON')
       );
       total = memItems.length;
       items = memItems.slice(skip, skip + limit);
@@ -670,14 +869,22 @@ export const getAmazonPricing = async (req, res) => {
  */
 export const getAmazonPricingBySku = async (req, res) => {
   try {
-    const { sellerId } = req.tenant;
+    const { sellerId, storeId = null } = req.tenant;
     const { sku } = req.params;
 
     let item = null;
     try {
-      item = await MarketplacePricing.findOne({ sellerId, externalSku: sku.trim() });
+      const query = { sellerId, provider: 'AMAZON', externalSku: sku.trim() };
+      if (storeId) query.storeId = storeId.toString();
+      item = await MarketplacePricing.findOne(query);
     } catch (e) {
-      item = inMemoryPricingMap.get(`${sellerId}_${sku.trim()}`);
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon pricing snapshot from MongoDB.');
+      }
+      const candidate = inMemoryPricingMap.get(`${sellerId}_${sku.trim()}`);
+      if (candidate && matchesTenantStore(candidate, { sellerId, storeId })) {
+        item = candidate;
+      }
     }
 
     if (!item) {
@@ -758,8 +965,11 @@ export const getAmazonOrders = async (req, res) => {
         Order.countDocuments(query),
       ]);
     } catch (dbErr) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon orders from MongoDB.');
+      }
       const memOrders = Array.from(inMemoryOrdersMap.values()).filter(
-        (o) => o.sellerId?.toString() === sellerId?.toString() && o.channel === 'AMAZON'
+        (o) => matchesTenantStore(o, req.tenant) && o.channel === 'AMAZON'
       );
       total = memOrders.length;
       orders = memOrders.slice(skip, skip + limit);
@@ -790,15 +1000,24 @@ export const getAmazonOrderById = async (req, res) => {
 
     let order = null;
     try {
-      order = await Order.findOne({
+      const orClauses = [{ externalOrderId: orderId }, { orderNumber: orderId }];
+      if (mongoose.Types.ObjectId.isValid(orderId)) {
+        orClauses.unshift({ _id: orderId });
+      }
+      const orderQuery = {
         sellerId,
         channel: 'AMAZON',
-        $or: [{ _id: orderId }, { externalOrderId: orderId }, { orderNumber: orderId }],
-      });
+        $or: orClauses,
+      };
+      if (req.tenant.storeId) orderQuery.storeId = req.tenant.storeId.toString();
+      order = await Order.findOne(orderQuery);
     } catch (dbErr) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon order from MongoDB.');
+      }
       order = Array.from(inMemoryOrdersMap.values()).find(
         (o) =>
-          o.sellerId?.toString() === sellerId?.toString() &&
+          matchesTenantStore(o, req.tenant) &&
           o.channel === 'AMAZON' &&
           (o._id?.toString() === orderId || o.externalOrderId === orderId || o.orderNumber === orderId)
       );
@@ -911,14 +1130,23 @@ export const getAmazonReturnById = async (req, res) => {
 
     let ret = null;
     try {
-      ret = await Return.findOne({
+      const orClauses = [{ rmaNumber: returnId }, { externalOrderId: returnId }];
+      if (mongoose.Types.ObjectId.isValid(returnId)) {
+        orClauses.unshift({ _id: returnId });
+      }
+      const retQuery = {
         sellerId,
-        $or: [{ _id: returnId }, { rmaNumber: returnId }, { externalOrderId: returnId }],
-      }).populate('orderId');
+        $or: orClauses,
+      };
+      if (req.tenant.storeId) retQuery.storeId = req.tenant.storeId.toString();
+      ret = await Return.findOne(retQuery).populate('orderId');
     } catch (dbErr) {
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to load Amazon return from MongoDB.');
+      }
       ret = Array.from(inMemoryReturnsMap.values()).find(
         (r) =>
-          r.sellerId?.toString() === sellerId?.toString() &&
+          matchesTenantStore(r, req.tenant) &&
           (r._id === returnId || r.rmaNumber === returnId || r.externalOrderId === returnId)
       );
     }
@@ -1150,37 +1378,62 @@ export const getEligibleCatalogueProducts = async (req, res) => {
 };
 
 /**
- * Get available Amazon product types (Definitions API)
+ * Get available Amazon product types (Definitions API v2020-09-01)
+ * Passes authenticated tenant AmazonSpApiClient when connected.
  * @route GET /api/channels/amazon/definitions/product-types
  */
 export const getAmazonProductTypes = async (req, res) => {
   try {
     const { q, marketplaceId } = req.query;
-    const result = await searchProductTypes(null, {
+    let client = null;
+    let resolvedMarketplace = marketplaceId || 'A21TJRUUN4KGV';
+
+    try {
+      const tenantClient = await getAmazonClientForTenant(req.tenant);
+      client = tenantClient.client;
+      resolvedMarketplace = marketplaceId || tenantClient.marketplaceId || 'A21TJRUUN4KGV';
+    } catch {
+      // Unconnected seller can still browse labeled DEVELOPMENT_FALLBACK product types
+      client = null;
+    }
+
+    const result = await searchProductTypes(client, {
       keywords: q,
-      marketplaceId: marketplaceId || 'A21TJRUUN4KGV',
+      marketplaceId: resolvedMarketplace,
     });
     return successResponse(res, 200, 'Amazon product types retrieved successfully', result);
   } catch (error) {
-    console.error('Get Amazon Product Types Error:', error);
+    console.error('Get Amazon Product Types Error:', error.code || error.message);
     return errorResponse(res, 500, error.message || 'Failed to retrieve Amazon product types');
   }
 };
 
 /**
- * Get schema definition for a specific product type
+ * Get schema definition for a specific product type (Definitions API v2020-09-01)
+ * Passes authenticated tenant AmazonSpApiClient when connected.
  * @route GET /api/channels/amazon/definitions/product-types/:productType
  */
 export const getAmazonProductTypeSchema = async (req, res) => {
   try {
     const { productType } = req.params;
     const { marketplaceId } = req.query;
-    const result = await getProductTypeDefinition(null, productType, {
-      marketplaceId: marketplaceId || 'A21TJRUUN4KGV',
+    let client = null;
+    let resolvedMarketplace = marketplaceId || 'A21TJRUUN4KGV';
+
+    try {
+      const tenantClient = await getAmazonClientForTenant(req.tenant);
+      client = tenantClient.client;
+      resolvedMarketplace = marketplaceId || tenantClient.marketplaceId || 'A21TJRUUN4KGV';
+    } catch {
+      client = null;
+    }
+
+    const result = await getProductTypeDefinition(client, productType, {
+      marketplaceId: resolvedMarketplace,
     });
     return successResponse(res, 200, `Schema for ${productType.toUpperCase()} retrieved successfully`, result);
   } catch (error) {
-    console.error('Get Amazon Product Type Schema Error:', error);
+    console.error('Get Amazon Product Type Schema Error:', error.code || error.message);
     return errorResponse(res, 500, error.message || 'Failed to retrieve product type schema');
   }
 };
@@ -1314,17 +1567,19 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
     }
 
     // Resolve channel connection
-    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON');
+    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
     let connection = null;
     try {
       connection = await ChannelConnection.findOne(connQuery).lean();
     } catch (e) {
-      // fallback
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to verify Amazon channel connection in MongoDB.');
+      }
     }
-    if (!connection) {
+    if (!connection && !isProductionEnv()) {
       connection = Array.from(inMemoryChannelsMap.values()).find(
         (c) =>
-          (c.sellerId?.toString() === sellerId?.toString() || c.tenantId?.toString() === sellerId?.toString()) &&
+          matchesTenantStore(c, { sellerId, storeId }) &&
           (c.provider === 'AMAZON' || c.channel === 'amazon')
       );
     }
@@ -1387,13 +1642,16 @@ export const createOrUpdateAmazonListingSubmission = async (req, res) => {
         { upsert: true, new: true, setDefaultsOnInsert: true }
       );
     } catch (dbErr) {
-      // Memory map fallback
+      if (isProductionEnv()) {
+        return errorResponse(res, 503, 'Service Unavailable: Unable to persist listing submission in MongoDB.');
+      }
+      // Memory map fallback (non-production only)
       const id = `sub_${Date.now()}`;
       doc = { _id: id, id, ...submissionData, createdAt: new Date(), updatedAt: new Date() };
       inMemorySubmissionsMap.set(id, doc);
     }
 
-    if (doc && doc._id) {
+    if (!isProductionEnv() && doc && doc._id) {
       inMemorySubmissionsMap.set(doc._id.toString(), doc);
     }
 

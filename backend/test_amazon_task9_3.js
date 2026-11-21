@@ -251,7 +251,7 @@ runAsyncTest('7. Sandbox Execution: Preserves real Amazon submission ID when pre
 
   // Mock Amazon SP-API Client returning official submissionId
   const mockClientWithId = {
-    credentials: { marketplaceId: 'A21TJRUUN4KGV' },
+    credentials: { sellingPartnerId: 'A2TESTMERCHANT1', marketplaceId: 'A21TJRUUN4KGV' },
     executeRequest: async () => ({
       submissionId: 'amzn1.spapi.submission.9988776655',
       _metadata: { status: 200, requestId: 'req-sandbox-123' },
@@ -268,7 +268,7 @@ runAsyncTest('7. Sandbox Execution: Preserves real Amazon submission ID when pre
 
   // Mock Amazon SP-API Client returning NO submissionId
   const mockClientNoId = {
-    credentials: { marketplaceId: 'A21TJRUUN4KGV' },
+    credentials: { sellingPartnerId: 'A2TESTMERCHANT1', marketplaceId: 'A21TJRUUN4KGV' },
     executeRequest: async () => ({
       _metadata: { status: 200, requestId: 'req-sandbox-456' },
     }),

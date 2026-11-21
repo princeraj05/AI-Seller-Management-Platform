@@ -1,5 +1,5 @@
 import { config, resolveSpApiEndpoint } from '../../../config/env.js';
-import { handleAmazonAuth, clearLwaTokenCache } from './amazon.auth.js';
+import { handleAmazonAuth, evictLwaTokenCache } from './amazon.auth.js';
 import {
   DEFAULT_RATE_LIMIT_CONFIG,
   calculateBackoffDelay,
@@ -7,12 +7,41 @@ import {
   sleep,
 } from './amazon.rateLimiter.js';
 
+export const AMAZON_EXECUTION_OUTCOMES = Object.freeze({
+  MOCK: 'MOCK',
+  DRY_RUN: 'DRY_RUN',
+  SANDBOX_HTTP_SUCCESS: 'SANDBOX_HTTP_SUCCESS',
+  SANDBOX_HTTP_FAILURE: 'SANDBOX_HTTP_FAILURE',
+});
+
+/**
+ * Strip any potentially sensitive fields from upstream SP-API error objects before attaching/returning.
+ */
+const sanitizeApiErrorPayload = (data) => {
+  if (!data || typeof data !== 'object') return null;
+  if (Array.isArray(data.errors)) {
+    return {
+      errors: data.errors.map((e) => ({
+        code: e.code || null,
+        message: e.message || null,
+        details: typeof e.details === 'string' ? e.details.slice(0, 300) : undefined,
+      })),
+    };
+  }
+  return {
+    code: data.code || data.error || null,
+    message: data.message || data.error_description || null,
+  };
+};
+
 export class AmazonSpApiClient {
   /**
    * @param {Object} credentials
    * @param {string} [credentials.clientId]
    * @param {string} [credentials.clientSecret]
    * @param {string} [credentials.refreshToken]
+   * @param {string} [credentials.sellerId]
+   * @param {string} [credentials.sellingPartnerId]
    * @param {string} [credentials.region] 'eu' (default for India), 'na', 'fe'
    * @param {boolean} [credentials.sandbox]
    * @param {Object} [credentials.rateLimitConfig]
@@ -30,14 +59,20 @@ export class AmazonSpApiClient {
         ? Boolean(credentials.sandbox)
         : (config.amazon?.env || process.env.AMAZON_SP_API_ENV || 'sandbox') === 'sandbox';
 
+    // Strictly per-tenant refresh token: NEVER fall back to global AMAZON_SP_API_REFRESH_TOKEN
+    const tenantRefreshToken =
+      typeof credentials.refreshToken === 'string' ? credentials.refreshToken.trim() : '';
+
     this.credentials = {
+      ...credentials,
       clientId: credentials.clientId || config.amazon?.clientId || process.env.AMAZON_SP_API_CLIENT_ID,
       clientSecret: credentials.clientSecret || config.amazon?.clientSecret || process.env.AMAZON_SP_API_CLIENT_SECRET,
       appId: credentials.appId || config.amazon?.appId || process.env.AMAZON_SP_API_APP_ID,
-      refreshToken: credentials.refreshToken || config.amazon?.refreshToken || process.env.AMAZON_SP_API_REFRESH_TOKEN,
+      refreshToken: tenantRefreshToken,
+      sellerId: credentials.sellerId || credentials.tenantId || null,
+      sellingPartnerId: credentials.sellingPartnerId || null,
       region: this.region,
       sandbox: this.isSandbox,
-      ...credentials,
     };
 
     // Region-aware endpoint (EU for India-first: sandbox.sellingpartnerapi-eu.amazon.com)
@@ -49,19 +84,26 @@ export class AmazonSpApiClient {
       ...(credentials.rateLimitConfig || {}),
     };
 
-    // Telemetry tracking for rate limit headers
+    // Telemetry tracking for rate limit headers & structured diagnostics
     this.lastRateLimit = null;
     this.lastRetryAfter = null;
+    this.lastHttpStatus = null;
+    this.lastRequestId = null;
+    this.lastDiagnostics = null;
   }
 
   /**
    * Obtain a valid LWA access token before issuing API requests
    */
-  async getAccessToken() {
-    const auth = await handleAmazonAuth(this.credentials);
+  async getAccessToken(authOptions = {}) {
+    const auth = await handleAmazonAuth({
+      ...this.credentials,
+      bypassCache: authOptions.bypassCache === true,
+    });
     if (!auth.authenticated) {
       const err = new Error(auth.message || 'LWA authentication failed');
       err.code = auth.code;
+      err.status = auth.status || 401;
       err.requiresSellerAuth = auth.requiresSellerAuth;
       throw err;
     }
@@ -69,19 +111,46 @@ export class AmazonSpApiClient {
   }
 
   /**
-   * Execute an authenticated SP-API request with rate limit handling, header parsing, and exponential backoff
+   * Build a secret-safe structured diagnostic record for an actual HTTP request
+   */
+  _buildDiagnostics({ httpStatus, endpoint, operation, durationMs, requestId, rateLimit, retryAfter, outcome }) {
+    return {
+      httpStatus: httpStatus ?? null,
+      endpoint,
+      operation,
+      durationMs,
+      requestId: requestId || null,
+      rateLimit: rateLimit ?? null,
+      retryAfter: retryAfter ?? null,
+      region: this.region,
+      environment: this.isSandbox ? 'sandbox' : 'production',
+      isSandbox: this.isSandbox,
+      baseUrl: this.baseUrl,
+      outcome,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Execute an authenticated SP-API request with rate limit handling, header parsing,
+   * exponential backoff, and structured secret-safe HTTP diagnostics.
    *
    * @param {string} endpointPath e.g. '/orders/2026-01-01/orders'
-   * @param {Object} options fetch options
+   * @param {Object} options fetch options (+ optional `operation`, `bypassCache`)
    */
   async executeRequest(endpointPath, options = {}) {
+    const cleanEndpoint = endpointPath.split('?')[0];
+    const method = (options.method || 'GET').toUpperCase();
+    const operation = options.operation || `${method} ${cleanEndpoint}`;
     const url = `${this.baseUrl}${endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`}`;
     const maxRetries = options.maxRetries ?? this.rateLimitConfig.maxRetries;
 
     let attempt = 0;
 
     while (true) {
-      const accessToken = await this.getAccessToken();
+      const accessToken = await this.getAccessToken({
+        bypassCache: options.bypassCache === true && attempt === 0,
+      });
 
       const headers = {
         'x-amz-access-token': accessToken,
@@ -91,11 +160,16 @@ export class AmazonSpApiClient {
         ...(options.headers || {}),
       };
 
+      const requestStartMs = Date.now();
+
       try {
-        const response = await fetch(url, {
-          ...options,
-          headers,
-        });
+        const fetchOpts = { ...options, headers };
+        delete fetchOpts.operation;
+        delete fetchOpts.bypassCache;
+        delete fetchOpts.maxRetries;
+
+        const response = await fetch(url, fetchOpts);
+        const durationMs = Date.now() - requestStartMs;
 
         // 1. Parse request ID, rate limit and retry headers
         const requestId =
@@ -113,14 +187,34 @@ export class AmazonSpApiClient {
           this.lastRetryAfter = retryAfter;
         }
 
-        // Sanitized diagnostic logging (Never logs tokens, secrets, or keys)
+        const outcome = response.ok
+          ? AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS
+          : AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE;
+
+        const diagnostics = this._buildDiagnostics({
+          httpStatus: response.status,
+          endpoint: cleanEndpoint,
+          operation,
+          durationMs,
+          requestId,
+          rateLimit: limit,
+          retryAfter,
+          outcome,
+        });
+        this.lastDiagnostics = diagnostics;
+
+        // Structured, secret-safe diagnostic logging (NEVER logs tokens, secrets, headers, bodies, or PII)
         console.log(
-          `[Amazon SP-API Diagnostics] HTTP ${response.status} | RequestId: ${requestId || 'N/A'} | Path: ${endpointPath.split('?')[0]}`
+          `[Amazon SP-API Diagnostics] op=${operation} | status=${response.status} | durationMs=${durationMs} | requestId=${requestId || 'N/A'} | endpoint=${cleanEndpoint} | outcome=${outcome}`
         );
 
-        // 2. Handle 401 Unauthorized: Invalidate cached token and retry once if fresh
+        // 2. Handle 401 Unauthorized: Evict ONLY this tenant's cached token and retry once if fresh
         if (response.status === 401) {
-          clearLwaTokenCache();
+          evictLwaTokenCache({
+            sellerId: this.credentials.sellerId,
+            clientId: this.credentials.clientId,
+            refreshToken: this.credentials.refreshToken,
+          });
           if (attempt === 0) {
             attempt++;
             continue;
@@ -136,11 +230,14 @@ export class AmazonSpApiClient {
             continue;
           }
 
-          const rateErr = new Error(`Amazon SP-API rate limit exceeded for ${endpointPath} (HTTP 429) after ${attempt} retries`);
+          const rateErr = new Error(
+            `Amazon SP-API rate limit exceeded for ${cleanEndpoint} (HTTP 429) after ${attempt} retries`
+          );
           rateErr.status = 429;
           rateErr.code = 'RATE_LIMITED';
           rateErr.retryAfter = retryAfter;
           rateErr.requestId = requestId;
+          rateErr.diagnostics = diagnostics;
           throw rateErr;
         }
 
@@ -156,26 +253,49 @@ export class AmazonSpApiClient {
 
           const err = new Error(errorMsg);
           err.status = response.status;
-          err.code = response.status === 403 ? 'FORBIDDEN' : 'API_ERROR';
+          err.code =
+            response.status === 401
+              ? 'UNAUTHORIZED'
+              : response.status === 403
+              ? 'FORBIDDEN'
+              : 'API_ERROR';
           err.requestId = requestId;
-          err.sanitizedData = data;
+          err.sanitizedData = sanitizeApiErrorPayload(data);
+          err.diagnostics = diagnostics;
           throw err;
         }
 
-        // Attach sanitized request metadata to response object
+        // Attach sanitized request metadata & diagnostics to response object
         if (data && typeof data === 'object') {
           data._metadata = {
             status: response.status,
             requestId,
             rateLimit: limit,
+            durationMs,
+            operation,
+            endpoint: cleanEndpoint,
+            outcome,
           };
         }
 
         return data;
       } catch (error) {
         if (error.code) throw error;
+        const durationMs = Date.now() - requestStartMs;
+        const diagnostics = this._buildDiagnostics({
+          httpStatus: null,
+          endpoint: cleanEndpoint,
+          operation,
+          durationMs,
+          requestId: null,
+          rateLimit: null,
+          retryAfter: null,
+          outcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+        });
+        this.lastDiagnostics = diagnostics;
         const netErr = new Error(`Amazon SP-API network failure: ${error.message}`);
         netErr.code = 'NETWORK_FAILURE';
+        netErr.diagnostics = diagnostics;
         throw netErr;
       }
     }
@@ -193,7 +313,9 @@ export class AmazonSpApiClient {
     const endpointPath = `/finances/v0/orders/${encodeURIComponent(cleanId)}/financialEvents`;
 
     try {
-      const responseData = await this.executeRequest(endpointPath);
+      const responseData = await this.executeRequest(endpointPath, {
+        operation: 'getOrderFinancialEvents',
+      });
       return responseData.FinancialEvents || responseData.payload?.FinancialEvents || responseData;
     } catch (error) {
       if (error.status === 404 || error.status === 400) {
@@ -208,10 +330,10 @@ export class AmazonSpApiClient {
   }
 
   /**
-   * Test connection state:
+   * Test connection state with cache-bypassing LWA verification:
    * 1. If Client ID/Secret missing: fails with MISSING_APP_CREDENTIALS
    * 2. If seller Refresh Token missing: reports clearly that Seller Central authorization is required
-   * 3. If Refresh Token present: performs actual LWA exchange
+   * 3. If Refresh Token present: performs fresh LWA exchange (bypassing cache)
    */
   async testConnection() {
     if (!this.credentials.clientId || !this.credentials.clientSecret) {
@@ -236,7 +358,10 @@ export class AmazonSpApiClient {
       };
     }
 
-    const auth = await handleAmazonAuth(this.credentials);
+    const auth = await handleAmazonAuth({
+      ...this.credentials,
+      bypassCache: true,
+    });
 
     if (!auth.authenticated) {
       return {
@@ -251,7 +376,7 @@ export class AmazonSpApiClient {
     return {
       success: true,
       authenticated: true,
-      message: 'Amazon SP-API Sandbox LWA authentication successful.',
+      message: `Amazon SP-API ${this.isSandbox ? 'Sandbox' : 'Production'} LWA authentication successful.`,
       provider: 'AMAZON',
       region: this.region,
       endpoint: this.baseUrl,
@@ -262,14 +387,21 @@ export class AmazonSpApiClient {
    * Return sanitized diagnostics from the most recent request
    */
   getLastRequestDiagnostics() {
-    return {
-      httpStatus: this.lastHttpStatus || null,
-      requestId: this.lastRequestId || null,
-      rateLimit: this.lastRateLimit || null,
-      retryAfter: this.lastRetryAfter || null,
-      region: this.region,
-      isSandbox: this.isSandbox,
-      baseUrl: this.baseUrl,
-    };
+    return (
+      this.lastDiagnostics || {
+        httpStatus: this.lastHttpStatus || null,
+        endpoint: null,
+        operation: null,
+        durationMs: null,
+        requestId: this.lastRequestId || null,
+        rateLimit: this.lastRateLimit || null,
+        retryAfter: this.lastRetryAfter || null,
+        region: this.region,
+        environment: this.isSandbox ? 'sandbox' : 'production',
+        isSandbox: this.isSandbox,
+        baseUrl: this.baseUrl,
+        outcome: null,
+      }
+    );
   }
 }

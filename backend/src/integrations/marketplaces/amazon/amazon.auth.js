@@ -1,24 +1,90 @@
+import crypto from 'crypto';
 import { config } from '../../../config/env.js';
 
-// In-memory cache for LWA access tokens to avoid redundant token exchanges
-// Key: SHA-256 or combination of clientId + prefix of refreshToken
+// In-memory cache for LWA access tokens to avoid redundant token exchanges.
+// Keyed strictly by SHA-256 of the full clientId + refreshToken (+ optional tenant scope)
+// so two tenants sharing the same token prefix can NEVER collide.
 const lwaTokenCache = new Map();
+// Secondary index: tenantId -> Set<cacheKey> for safe per-tenant eviction on disconnect
+const tenantTokenCacheIndex = new Map();
 
 /**
- * Clear LWA token cache (useful on 401 Unauthorized from SP-API)
+ * Compute collision-resistant SHA-256 cache key from full clientId, full refreshToken,
+ * and optional tenant scope.
+ *
+ * @param {string} clientId
+ * @param {string} refreshToken
+ * @param {string|null} [tenantId=null]
+ * @returns {string}
  */
-export const clearLwaTokenCache = () => {
-  lwaTokenCache.clear();
+export const computeLwaCacheKey = (clientId, refreshToken, tenantId = null) => {
+  const scope = tenantId ? String(tenantId).trim() : '';
+  return crypto
+    .createHash('sha256')
+    .update(`lwa-v2|${scope}|${String(clientId || '')}|${String(refreshToken || '')}`)
+    .digest('hex');
 };
 
 /**
- * Handle Amazon Login with Amazon (LWA) token exchange
- * Exchanges a seller-authorized Refresh Token for an Access Token
+ * Clear entire LWA token cache (intended for unit tests only).
+ */
+export const clearLwaTokenCache = () => {
+  lwaTokenCache.clear();
+  tenantTokenCacheIndex.clear();
+};
+
+/**
+ * Safely evict LWA cached access token(s) for a specific tenant and/or refreshToken
+ * without affecting any other tenant's cached tokens.
+ *
+ * @param {Object} [params]
+ * @param {string|null} [params.sellerId]
+ * @param {string|null} [params.tenantId]
+ * @param {string|null} [params.clientId]
+ * @param {string|null} [params.refreshToken]
+ * @returns {number} number of cache entries removed
+ */
+export const evictLwaTokenCache = ({ sellerId = null, tenantId = null, clientId = null, refreshToken = null } = {}) => {
+  let evicted = 0;
+  const effectiveTenant = sellerId || tenantId ? String(sellerId || tenantId).trim() : null;
+
+  if (effectiveTenant && tenantTokenCacheIndex.has(effectiveTenant)) {
+    const keys = tenantTokenCacheIndex.get(effectiveTenant);
+    for (const key of keys) {
+      if (lwaTokenCache.delete(key)) {
+        evicted++;
+      }
+    }
+    tenantTokenCacheIndex.delete(effectiveTenant);
+  }
+
+  if (refreshToken) {
+    const resolvedClientId = clientId || config.amazon?.clientId || process.env.AMAZON_SP_API_CLIENT_ID || '';
+    const candidateKeys = new Set([
+      computeLwaCacheKey(resolvedClientId, refreshToken, effectiveTenant),
+      computeLwaCacheKey(resolvedClientId, refreshToken, null),
+    ]);
+    for (const key of candidateKeys) {
+      if (lwaTokenCache.delete(key)) {
+        evicted++;
+      }
+    }
+  }
+
+  return evicted;
+};
+
+/**
+ * Handle Amazon Login with Amazon (LWA) token exchange.
+ * Exchanges a tenant-specific seller-authorized Refresh Token for an Access Token.
+ * NEVER falls back to a global AMAZON_SP_API_REFRESH_TOKEN environment variable.
  *
  * @param {Object} credentials
  * @param {string} [credentials.clientId]
  * @param {string} [credentials.clientSecret]
  * @param {string} [credentials.refreshToken]
+ * @param {string} [credentials.sellerId]
+ * @param {string} [credentials.tenantId]
  * @param {string} [credentials.lwaEndpoint]
  * @returns {Promise<{authenticated: boolean, accessToken?: string, expiresIn?: number, expiresAt?: number, message?: string, requiresSellerAuth?: boolean, code?: string}>}
  */
@@ -33,10 +99,13 @@ export const handleAmazonAuth = async (credentials = {}) => {
       ? credentials.clientSecret
       : config.amazon?.clientSecret || process.env.AMAZON_SP_API_CLIENT_SECRET;
 
+  // Strictly require an explicit per-tenant refresh token; NEVER fall back to global env token
   const refreshToken =
-    credentials.refreshToken !== undefined
-      ? credentials.refreshToken
-      : config.amazon?.refreshToken || process.env.AMAZON_SP_API_REFRESH_TOKEN;
+    typeof credentials.refreshToken === 'string' ? credentials.refreshToken.trim() : '';
+
+  const tenantScope = credentials.sellerId || credentials.tenantId
+    ? String(credentials.sellerId || credentials.tenantId).trim()
+    : null;
 
   const lwaEndpoint = credentials.lwaEndpoint || config.amazon?.lwaEndpoint || 'https://api.amazon.com/auth/o2/token';
 
@@ -59,9 +128,10 @@ export const handleAmazonAuth = async (credentials = {}) => {
     };
   }
 
-  // 3. Check in-memory cache for an active, unexpired token
-  const cacheKey = `${clientId}_${refreshToken.substring(0, 16)}`;
-  const cached = lwaTokenCache.get(cacheKey);
+  // 3. Check in-memory cache using full SHA-256 key (unless bypassCache is explicitly requested)
+  const bypassCache = credentials.bypassCache === true;
+  const cacheKey = computeLwaCacheKey(clientId, refreshToken, tenantScope);
+  const cached = !bypassCache ? lwaTokenCache.get(cacheKey) : null;
 
   if (cached && Date.now() < cached.expiresAt) {
     return {
@@ -114,8 +184,9 @@ export const handleAmazonAuth = async (credentials = {}) => {
     }
 
     const expiresIn = Number(data.expires_in) || 3600;
-    // Buffer expiration by 5 minutes (300 seconds) to ensure token never expires mid-flight
-    const expiresAt = Date.now() + Math.max(expiresIn - 300, 60) * 1000;
+    // Buffer expiration by 5 minutes (300 seconds) without extending sub-60s TTLs
+    const bufferedSeconds = expiresIn > 300 ? expiresIn - 300 : Math.max(Math.floor(expiresIn / 2), 1);
+    const expiresAt = Date.now() + bufferedSeconds * 1000;
 
     const authResult = {
       authenticated: true,
@@ -126,12 +197,20 @@ export const handleAmazonAuth = async (credentials = {}) => {
       isCached: false,
     };
 
-    // Cache the verified token
+    // Cache the verified token under full SHA-256 key and index by tenant for eviction
     lwaTokenCache.set(cacheKey, {
       accessToken: data.access_token,
       expiresAt,
       tokenType: data.token_type || 'bearer',
+      tenantScope,
     });
+
+    if (tenantScope) {
+      if (!tenantTokenCacheIndex.has(tenantScope)) {
+        tenantTokenCacheIndex.set(tenantScope, new Set());
+      }
+      tenantTokenCacheIndex.get(tenantScope).add(cacheKey);
+    }
 
     return authResult;
   } catch (error) {
@@ -231,4 +310,3 @@ export const exchangeLwaAuthCode = async (authCode, options = {}) => {
     };
   }
 };
-

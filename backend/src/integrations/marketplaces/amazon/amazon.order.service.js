@@ -4,7 +4,12 @@ import { Order } from '../../../modules/orders/order.model.js';
 import { Product } from '../../../modules/products/product.model.js';
 import { Return } from '../../../modules/returns/return.model.js';
 import { inMemoryOrdersMap } from '../../../modules/orders/order.service.js';
-import { inMemoryChannelsMap } from '../../../modules/channels/channel.service.js';
+import {
+  inMemoryChannelsMap,
+  buildTenantConnectionQuery,
+  matchesTenantStore,
+} from '../../../modules/channels/channel.service.js';
+import { isProductionEnv } from '../../../config/storage.js';
 import { inMemoryReturnsMap } from '../../../modules/returns/return.service.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
 import { AmazonSpApiClient } from './amazon.client.js';
@@ -189,19 +194,28 @@ export const getAmazonOrderItems = async (client, orderId, options = {}) => {
  * @returns {Promise<Object>} Sync outcome summary
  */
 export const syncAmazonOrdersService = async (tenant, options = {}) => {
-  const { sellerId } = tenant;
+  const { sellerId, storeId = null } = tenant;
 
   // 1. Verify channel connection first to obtain channelId for lock scoping
   let connection = null;
   try {
-    connection = await withDbTimeout(ChannelConnection.findOne({ sellerId, provider: 'AMAZON' }), 1000);
+    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
+    connection = await withDbTimeout(ChannelConnection.findOne(connQuery), 1000);
   } catch (err) {
-    // DB offline fallback
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to verify Amazon connection in MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+    // DB offline fallback in non-production only
   }
 
-  if (!connection) {
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
-      (c) => c.sellerId?.toString() === sellerId?.toString() && c.provider === 'AMAZON'
+      (c) =>
+        matchesTenantStore(c, { sellerId, storeId }) &&
+        (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
 
@@ -250,8 +264,9 @@ export const syncAmazonOrdersService = async (tenant, options = {}) => {
     const marketplaceId = options.marketplaceId || connection.marketplaceId || 'A21TJRUUN4KGV';
     const region = connection.marketplaceRegion || 'eu';
 
-    // 4. Initialize SP-API client
+    // 4. Initialize tenant-scoped SP-API client
     const client = new AmazonSpApiClient({
+      sellerId: sellerId ? sellerId.toString() : null,
       refreshToken: decrypted.refreshToken,
       region,
       marketplaceId,
@@ -819,18 +834,28 @@ export const getAmazonOrderItemsService = async (tenant, orderId) => {
  * @returns {Promise<{ success: boolean, order: Object }>}
  */
 export const syncSingleAmazonOrderService = async (tenant, orderId) => {
-  const { sellerId } = tenant;
+  const { sellerId, storeId = null } = tenant;
   const cleanId = String(orderId).trim();
 
-  // 1. Obtain channel connection
+  // 1. Obtain channel connection (sellerId + storeId scoped)
   let connection = null;
   try {
-    connection = await withDbTimeout(ChannelConnection.findOne({ sellerId, provider: 'AMAZON' }), 1000);
-  } catch (err) {}
+    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
+    connection = await withDbTimeout(ChannelConnection.findOne(connQuery), 1000);
+  } catch (err) {
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to verify Amazon connection in MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+  }
 
-  if (!connection) {
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
-      (c) => c.sellerId?.toString() === sellerId?.toString() && c.provider === 'AMAZON'
+      (c) =>
+        matchesTenantStore(c, { sellerId, storeId }) &&
+        (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
 
@@ -850,6 +875,7 @@ export const syncSingleAmazonOrderService = async (tenant, orderId) => {
   }
 
   const client = new AmazonSpApiClient({
+    sellerId: sellerId ? sellerId.toString() : null,
     refreshToken: decrypted.refreshToken,
     region: connection.marketplaceRegion || 'eu',
     marketplaceId: connection.marketplaceId || 'A21TJRUUN4KGV',
@@ -892,14 +918,22 @@ export const syncSingleAmazonOrderService = async (tenant, orderId) => {
       { new: true, upsert: true }
     );
   } catch (dbErr) {
+    if (isProductionEnv()) {
+      const err = new Error('Service Unavailable: Unable to persist Amazon order in MongoDB.');
+      err.code = 'SERVICE_UNAVAILABLE';
+      err.status = 503;
+      throw err;
+    }
+    const scopedKey = `${sellerId}:${cleanId}`;
     const memoryOrder = {
-      _id: `mem_amz_ord_${cleanId}`,
-      id: `mem_amz_ord_${cleanId}`,
+      _id: `mem_amz_ord_${scopedKey}`,
+      id: `mem_amz_ord_${scopedKey}`,
+      storeId: storeId ? String(storeId) : null,
       ...payload,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    inMemoryOrdersMap.set(cleanId, memoryOrder);
+    inMemoryOrdersMap.set(scopedKey, memoryOrder);
     savedOrder = memoryOrder;
   }
 
@@ -1120,9 +1154,16 @@ export const syncAmazonReturnsService = async (tenant, options = {}) => {
         returnsCreated++;
       }
     } catch (dbErr) {
-      inMemoryReturnsMap.set(rma, {
-        _id: `mem_ret_${rma}`,
-        id: `mem_ret_${rma}`,
+      if (isProductionEnv()) {
+        const err = new Error('Service Unavailable: Unable to persist Amazon return in MongoDB.');
+        err.code = 'SERVICE_UNAVAILABLE';
+        err.status = 503;
+        throw err;
+      }
+      const scopedRmaKey = `${sellerId}:${rma}`;
+      inMemoryReturnsMap.set(scopedRmaKey, {
+        _id: `mem_ret_${scopedRmaKey}`,
+        id: `mem_ret_${scopedRmaKey}`,
         ...returnDoc,
         createdAt: new Date(),
         updatedAt: new Date(),

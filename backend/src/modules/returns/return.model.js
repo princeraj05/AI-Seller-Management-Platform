@@ -51,7 +51,6 @@ const returnSchema = new mongoose.Schema(
     rmaNumber: {
       type: String,
       required: true,
-      unique: true,
     },
     orderId: {
       type: mongoose.Schema.Types.Mixed,

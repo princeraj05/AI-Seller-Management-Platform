@@ -45,6 +45,9 @@ import {
   getAmazonPricingStatusApi,
 } from '../../services/channelService';
 
+const SANDBOX_STATIC_MOCK_NOTICE =
+  'Sandbox API connection verified. Real seller authorization and India marketplace enrollment have not been verified.';
+
 export default function AmazonChannel() {
   const [searchParams, setSearchParams] = useSearchParams();
   const urlTab = searchParams.get('tab');
@@ -97,6 +100,9 @@ export default function AmazonChannel() {
   const [catalogResults, setCatalogResults] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogPagination, setCatalogPagination] = useState(null);
+  const [catalogHasSearched, setCatalogHasSearched] = useState(false);
+  const [catalogError, setCatalogError] = useState(null);
+  const [catalogDiagnostics, setCatalogDiagnostics] = useState(null);
 
   // General Sync Status State
   const [syncStatus, setSyncStatus] = useState(null);
@@ -209,16 +215,42 @@ export default function AmazonChannel() {
     fetchConnection();
     fetchSyncStatus();
 
-    // Check if redirected from OAuth callback
+    // Check if redirected from OAuth callback (uses sanitized status & error code only)
     const oauthStatus = searchParams.get('status');
+    const oauthCode = searchParams.get('code');
     const oauthMessage = searchParams.get('message');
+    const oauthErrorMessages = {
+      MISSING_STATE: 'Missing OAuth state parameter. Please restart Amazon authorization.',
+      MISSING_OAUTH_CODE: 'Amazon authorization code was not received. Please try again.',
+      INVALID_OAUTH_STATE: 'Invalid OAuth state signature. Please restart Amazon authorization.',
+      OAUTH_STATE_EXPIRED: 'Amazon authorization session expired. Please initiate connection again.',
+      OAUTH_STATE_REPLAY: 'This OAuth callback link was already used. Please initiate a new authorization.',
+      OAUTH_STATE_STORE_UNAVAILABLE: 'Authorization verification service is temporarily unavailable. Please retry.',
+      CROSS_TENANT_STATE_MISMATCH: 'Account mismatch detected during OAuth authorization.',
+      LWA_EXCHANGE_FAILED: 'Amazon LWA token exchange failed. Verify app credentials and Redirect URI.',
+      LWA_UNAUTHORIZED: 'Amazon rejected authorization credentials (HTTP 401). Please reauthorize.',
+      SP_API_FORBIDDEN: 'Amazon SP-API denied Sellers API access (HTTP 403). Check app roles.',
+      MARKETPLACE_NOT_AUTHORIZED: 'Seller account is not authorized for Amazon India (A21TJRUUN4KGV).',
+      EMPTY_MARKETPLACE_PARTICIPATIONS: 'No active Amazon marketplace participations were found for this seller.',
+      SELLER_VERIFICATION_FAILED: 'Unable to verify seller authorization with Amazon Sellers API.',
+    };
+
     if (oauthStatus === 'connected') {
-      setMessage({ type: 'success', text: 'Amazon Seller Central OAuth authorization completed successfully!' });
+      setMessage({ type: 'success', text: 'Amazon Seller Central OAuth authorization verified and connected!' });
+      searchParams.delete('status');
+      setSearchParams(searchParams, { replace: true });
+    } else if (oauthStatus === 'sandbox_transport_verified') {
+      setMessage({ type: 'info', text: SANDBOX_STATIC_MOCK_NOTICE });
       searchParams.delete('status');
       setSearchParams(searchParams, { replace: true });
     } else if (oauthStatus === 'error') {
-      setMessage({ type: 'error', text: oauthMessage || 'Amazon OAuth authorization failed.' });
+      const safeText =
+        (oauthCode && oauthErrorMessages[oauthCode]) ||
+        oauthMessage ||
+        'Amazon OAuth authorization failed. Please try again.';
+      setMessage({ type: 'error', text: safeText });
       searchParams.delete('status');
+      searchParams.delete('code');
       searchParams.delete('message');
       setSearchParams(searchParams, { replace: true });
     }
@@ -237,12 +269,22 @@ export default function AmazonChannel() {
     setTestingLoading(true);
     try {
       const res = await testAmazonConnectionApi();
-      if (res.success && res.data?.authenticated) {
-        setMessage({ type: 'success', text: res.message || 'Amazon SP-API Sandbox connection verified!' });
+      const payload = res?.data || res || {};
+      const isStaticMock =
+        payload.status === 'SANDBOX_TRANSPORT_VERIFIED' ||
+        payload.verificationMode === 'SANDBOX_STATIC_MOCK';
+
+      if (isStaticMock) {
+        setMessage({ type: 'info', text: SANDBOX_STATIC_MOCK_NOTICE });
+      } else if (res.success && payload.sellerAuthorized) {
+        setMessage({
+          type: 'success',
+          text: payload.message || res.message || 'Amazon SP-API seller authorization verified!',
+        });
       } else {
         setMessage({
           type: 'error',
-          text: res.message || res.data?.message || 'Amazon connection test failed.',
+          text: payload.message || res.message || 'Amazon connection test failed.',
         });
       }
       await fetchConnection();
@@ -348,30 +390,64 @@ export default function AmazonChannel() {
 
   const handleCatalogSearchSubmit = async (e) => {
     e.preventDefault();
-    if (!catalogQuery.trim()) return;
+    if (catalogLoading) return; // Prevent duplicate submissions
+
+    const trimmedQuery = catalogQuery.trim();
+    if (!trimmedQuery) {
+      setCatalogError({
+        message: 'Please enter a keyword or product identifier before searching.',
+        code: 'INVALID_CATALOG_QUERY',
+      });
+      return;
+    }
 
     setCatalogLoading(true);
+    setCatalogError(null);
+    setCatalogDiagnostics(null);
     setMessage(null);
     try {
       const params = {};
       if (catalogIdType === 'KEYWORDS') {
-        params.keywords = catalogQuery.trim();
+        params.keywords = trimmedQuery;
       } else {
-        params.identifiers = catalogQuery.trim();
+        params.identifiers = trimmedQuery;
         params.identifiersType = catalogIdType;
       }
 
       const res = await searchAmazonCatalogApi(params);
-      if (res.success && res.data) {
-        setCatalogResults(res.data.items || []);
-        setCatalogPagination(res.data.pagination || null);
-        if ((res.data.items || []).length === 0) {
-          setMessage({ type: 'info', text: 'No catalog items found matching your query.' });
-        }
+      const data = res?.data || res || {};
+      const items = Array.isArray(data.items) ? data.items : [];
+      setCatalogResults(items);
+      setCatalogPagination(data.pagination || null);
+      setCatalogDiagnostics(data.diagnostics || null);
+      setCatalogHasSearched(true);
+      if (items.length === 0) {
+        setMessage({
+          type: 'info',
+          text: `No Amazon catalog items found for "${trimmedQuery}" in marketplace ${data.marketplaceId || connection?.marketplaceId || 'A21TJRUUN4KGV'}.`,
+        });
       }
     } catch (err) {
-      setMessage({ type: 'error', text: err.message || 'Catalog search failed.' });
+      const structuredError = {
+        message: err.message || 'Catalog search failed.',
+        code: err.code || 'CATALOG_SEARCH_FAILED',
+        errorCategory: err.errorCategory || (err.sandboxStaticNoMatch ? 'UNSUPPORTED_SANDBOX_QUERY' : 'API_FAILURE'),
+        status: err.status || null,
+        amazonErrorCode: err.amazonErrorCode || null,
+        amazonErrorMessage: err.amazonErrorMessage || null,
+        amazonErrorDetails: err.amazonErrorDetails || null,
+        sandboxStaticNoMatch: Boolean(err.sandboxStaticNoMatch),
+        marketplaceId: err.marketplaceId || connection?.marketplaceId || 'A21TJRUUN4KGV',
+        diagnostics: err.diagnostics || null,
+      };
+      setCatalogError(structuredError);
+      setCatalogDiagnostics(err.diagnostics || null);
       setCatalogResults([]);
+      setCatalogHasSearched(true);
+      setMessage({
+        type: structuredError.sandboxStaticNoMatch ? 'info' : 'error',
+        text: structuredError.message,
+      });
     } finally {
       setCatalogLoading(false);
     }
@@ -431,13 +507,20 @@ export default function AmazonChannel() {
       });
 
       if (res.success) {
-        setMessage({
-          type: 'success',
-          text: 'Amazon Sandbox account connected & verified successfully via LWA Refresh Token!',
-        });
+        const immediateConn = res?.connection || res?.channel || res?.data?.connection || res?.data?.channel;
+        const isStaticMock =
+          immediateConn?.status === 'SANDBOX_TRANSPORT_VERIFIED' ||
+          immediateConn?.verificationMode === 'SANDBOX_STATIC_MOCK';
+        setMessage(
+          isStaticMock
+            ? { type: 'info', text: SANDBOX_STATIC_MOCK_NOTICE }
+            : {
+                type: 'success',
+                text: res.message || 'Amazon Sandbox account connected & seller authorization verified!',
+              }
+        );
         setShowConnectModal(false);
         setFormData((prev) => ({ ...prev, refreshToken: '' }));
-        const immediateConn = res?.connection || res?.channel || res?.data?.connection || res?.data?.channel;
         if (immediateConn) {
           setConnection(immediateConn);
         }
@@ -452,7 +535,11 @@ export default function AmazonChannel() {
     }
   };
 
-  const isConnected = connection && (connection.status === 'CONNECTED' || connection.connected === true);
+  const isSandboxTransportVerified = connection?.status === 'SANDBOX_TRANSPORT_VERIFIED';
+  const isConnected =
+    Boolean(connection) &&
+    connection.status === 'CONNECTED' &&
+    connection.sellerAuthorizationVerified !== false;
   const isPending = connection && connection.status === 'PENDING';
   const isError = connection && (connection.status === 'ERROR' || connection.status === 'REAUTH_REQUIRED');
 
@@ -464,7 +551,7 @@ export default function AmazonChannel() {
           <ArrowLeft className="w-4 h-4" /> Back to Channels
         </Link>
         <div className="flex items-center gap-2">
-          {isConnected ? (
+          {isConnected || isSandboxTransportVerified ? (
             <>
               <button
                 onClick={handleDisconnect}
@@ -482,15 +569,26 @@ export default function AmazonChannel() {
                 {testingLoading ? 'Testing...' : 'Test Connection'}
               </button>
 
-              <button
-                onClick={() => setActiveTab('publish')}
-                className="bg-amber-500 hover:bg-amber-600 text-white font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
-              >
-                <PlusCircle className="w-4 h-4" />
-                Create Amazon Listing
-              </button>
+              {isSandboxTransportVerified && (
+                <button
+                  onClick={() => setShowConnectModal(true)}
+                  className="border border-amber-300 text-amber-800 hover:bg-amber-50 font-semibold px-3 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
+                >
+                  <KeyRound className="w-4 h-4" /> Reconnect / Update
+                </button>
+              )}
 
-              {activeTab === 'listings' && (
+              {isConnected && (
+                <button
+                  onClick={() => setActiveTab('publish')}
+                  className="bg-amber-500 hover:bg-amber-600 text-white font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
+                >
+                  <PlusCircle className="w-4 h-4" />
+                  Create Amazon Listing
+                </button>
+              )}
+
+              {isConnected && activeTab === 'listings' && (
                 <button
                   onClick={handleTriggerListingsSync}
                   disabled={actionLoading || testingLoading || syncingLoading}
@@ -501,7 +599,7 @@ export default function AmazonChannel() {
                 </button>
               )}
 
-              {activeTab === 'inventory' && (
+              {isConnected && activeTab === 'inventory' && (
                 <button
                   onClick={handleTriggerInventorySync}
                   disabled={actionLoading || testingLoading || syncingInvLoading}
@@ -512,7 +610,7 @@ export default function AmazonChannel() {
                 </button>
               )}
 
-              {activeTab === 'pricing' && (
+              {isConnected && activeTab === 'pricing' && (
                 <button
                   onClick={handleTriggerPricingSync}
                   disabled={actionLoading || testingLoading || syncingPriceLoading}
@@ -566,7 +664,9 @@ export default function AmazonChannel() {
             <h1 className="text-xl font-bold text-slate-900 truncate">Amazon Seller Central (SP-API)</h1>
             <p className="text-slate-500 truncate">
               {isConnected
-                ? `Merchant / Partner ID: ${connection.sellingPartnerId || 'Active'} • Region: Europe / India (eu) • Marketplace: Amazon India`
+                ? `Merchant / Partner ID: ${connection.sellingPartnerId || 'Verified'} • Region: Europe / India (${connection.marketplaceRegion || 'eu'}) • Marketplace: ${connection.indiaMarketplaceAuthorized ? 'Amazon India (Authorized)' : connection.marketplaceId || 'A21TJRUUN4KGV'}`
+                : isSandboxTransportVerified
+                ? `Seller ID: ${connection.sellingPartnerId || 'Not provided (Sandbox transport-only)'} • Region: ${connection.marketplaceRegion || 'eu'} • Target Marketplace: India (${connection.marketplaceId || 'A21TJRUUN4KGV'}) — Enrollment Not Verified`
                 : isPending
                 ? `Pending Seller Central Authorization`
                 : isError
@@ -577,6 +677,10 @@ export default function AmazonChannel() {
           {isConnected ? (
             <span className="ml-auto bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
               <CheckCircle2 className="w-3.5 h-3.5" /> Connected & Active
+            </span>
+          ) : isSandboxTransportVerified ? (
+            <span className="ml-auto bg-amber-100 text-amber-800 border border-amber-200 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
+              <Info className="w-3.5 h-3.5" /> Sandbox Transport Verified (Static Mock)
             </span>
           ) : isPending ? (
             <span className="ml-auto bg-amber-100 text-amber-700 px-3 py-1 rounded-full font-bold flex items-center gap-1 shrink-0">
@@ -592,6 +696,48 @@ export default function AmazonChannel() {
             </span>
           )}
         </div>
+
+        {isSandboxTransportVerified && (
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 space-y-2">
+            <div className="flex items-start gap-2">
+              <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-bold text-xs">{SANDBOX_STATIC_MOCK_NOTICE}</p>
+                <p className="text-[11px] text-amber-800">
+                  Amazon&apos;s EU Static Sandbox Sellers API returned its hardcoded static mock response. Your LWA refresh token and Sandbox HTTPS transport succeeded, but real seller authorization and India ({connection?.marketplaceId || 'A21TJRUUN4KGV'}) enrollment are not verified yet.
+                </p>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 pt-1 text-[10px]">
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">LWA Exchange</span>
+                <span className="font-bold text-emerald-700">{connection.lwaVerified ? 'Verified' : 'Not Verified'}</span>
+              </div>
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">Sandbox Transport</span>
+                <span className="font-bold text-emerald-700">{connection.sandboxTransportVerified ? 'Verified' : 'Not Verified'}</span>
+              </div>
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">Seller Auth</span>
+                <span className="font-bold text-amber-800">{connection.sellerAuthorizationVerified ? 'Verified' : 'Not Verified'}</span>
+              </div>
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">India Enrollment</span>
+                <span className="font-bold text-amber-800">{connection.indiaMarketplaceAuthorized ? 'Authorized' : 'Not Verified'}</span>
+              </div>
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">Verification Mode</span>
+                <span className="font-bold text-slate-800">{connection.verificationMode || 'SANDBOX_STATIC_MOCK'}</span>
+              </div>
+              <div className="bg-white/80 rounded-lg px-2 py-1 border border-amber-100">
+                <span className="text-slate-500 block">Last Verified</span>
+                <span className="font-bold text-slate-800">
+                  {connection.lastVerifiedAt ? new Date(connection.lastVerifiedAt).toLocaleTimeString() : '—'}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Sync Summary & Metadata Bar */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 py-1">
@@ -615,7 +761,14 @@ export default function AmazonChannel() {
             <span className="text-sm font-extrabold text-slate-900 mt-0.5 block flex items-center gap-1">
               <Globe className="w-3.5 h-3.5 text-amber-500" /> Amazon India
             </span>
-            <span className="text-[10px] text-slate-400">ID: {connection?.marketplaceId || 'A21TJRUUN4KGV'} • eu</span>
+            <span className="text-[10px] text-slate-400">
+              ID: {connection?.marketplaceId || 'A21TJRUUN4KGV'} • {connection?.marketplaceRegion || 'eu'}
+              {connection?.indiaMarketplaceAuthorized
+                ? ' • Authorized'
+                : isSandboxTransportVerified
+                ? ' • Enrollment Not Verified'
+                : ''}
+            </span>
           </div>
           <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
             <span className="text-slate-400 font-semibold block text-[10px] uppercase">Security Engine</span>
@@ -1168,7 +1321,8 @@ export default function AmazonChannel() {
                 <select
                   value={catalogIdType}
                   onChange={(e) => setCatalogIdType(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs bg-white focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                  disabled={catalogLoading}
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs bg-white focus:ring-2 focus:ring-amber-500 focus:outline-none disabled:opacity-50"
                 >
                   <option value="KEYWORDS">Keywords Search</option>
                   <option value="ASIN">ASIN</option>
@@ -1182,12 +1336,13 @@ export default function AmazonChannel() {
                   type="text"
                   value={catalogQuery}
                   onChange={(e) => setCatalogQuery(e.target.value)}
+                  disabled={catalogLoading}
                   placeholder={
                     catalogIdType === 'KEYWORDS'
                       ? 'e.g. wireless earbuds, cotton t-shirt...'
                       : `Enter ${catalogIdType} (e.g. B08N5WRWNW)`
                   }
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none disabled:opacity-50"
                   required
                 />
               </div>
@@ -1209,7 +1364,61 @@ export default function AmazonChannel() {
                 )}
               </button>
             </form>
+
+            {catalogDiagnostics && (
+              <div className="flex flex-wrap items-center gap-3 pt-1 text-[10px] text-slate-500 border-t border-slate-100">
+                <span>
+                  Endpoint: <code className="font-mono text-slate-700">{catalogDiagnostics.baseUrl || 'https://sandbox.sellingpartnerapi-eu.amazon.com'}{catalogDiagnostics.endpoint || '/catalog/2022-04-01/items'}</code>
+                </span>
+                <span>HTTP: <strong>{catalogDiagnostics.httpStatus ?? 'N/A'}</strong></span>
+                <span>Duration: <strong>{catalogDiagnostics.durationMs != null ? `${catalogDiagnostics.durationMs}ms` : 'N/A'}</strong></span>
+                <span>Request ID: <code className="font-mono text-slate-700">{catalogDiagnostics.requestId || 'N/A'}</code></span>
+                <span>Marketplace: <strong>{connection?.marketplaceId || 'A21TJRUUN4KGV'}</strong></span>
+              </div>
+            )}
           </div>
+
+          {catalogError && (
+            <div
+              className={`rounded-xl border p-4 space-y-2 ${
+                catalogError.sandboxStaticNoMatch
+                  ? 'bg-amber-50 border-amber-200 text-amber-900'
+                  : 'bg-rose-50 border-rose-200 text-rose-800'
+              }`}
+            >
+              <div className="flex items-start gap-2">
+                {catalogError.sandboxStaticNoMatch ? (
+                  <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                )}
+                <div className="space-y-1 min-w-0">
+                  <p className="font-bold text-xs">
+                    {catalogError.sandboxStaticNoMatch
+                      ? 'Amazon EU Static Sandbox — Unmatched Catalog Query (HTTP 400 InvalidInput)'
+                      : 'Amazon Catalog Search Failed'}
+                  </p>
+                  <p className="text-[11px] leading-relaxed">{catalogError.message}</p>
+                  {(catalogError.amazonErrorCode || catalogError.amazonErrorMessage) && (
+                    <p className="text-[10px] font-mono opacity-85">
+                      Amazon Response: {catalogError.amazonErrorCode || 'ERROR'} — {catalogError.amazonErrorMessage || 'Unknown error'}
+                      {catalogError.diagnostics?.requestId ? ` (x-amzn-RequestId: ${catalogError.diagnostics.requestId})` : ''}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!catalogLoading && !catalogError && catalogHasSearched && catalogResults.length === 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500 space-y-1">
+              <Package className="w-8 h-8 mx-auto text-slate-300" />
+              <p className="font-semibold text-slate-700 text-xs">No Amazon catalog products returned</p>
+              <p className="text-[11px] text-slate-400">
+                Amazon returned 0 items for &ldquo;{catalogQuery}&rdquo; in India ({connection?.marketplaceId || 'A21TJRUUN4KGV'}). No synthetic or mock items were generated.
+              </p>
+            </div>
+          )}
 
           {catalogResults.length > 0 && (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">

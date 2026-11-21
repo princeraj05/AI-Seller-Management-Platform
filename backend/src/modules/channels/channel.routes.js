@@ -56,6 +56,11 @@ import { authorizeRoles } from '../../middleware/rbacMiddleware.js';
 
 const router = express.Router();
 
+// Public browser OAuth redirect callback from Amazon Seller Central.
+// Does NOT require Bearer auth; tenant & seller identity are bound strictly via
+// the cryptographically signed, expiring, atomic single-use MongoDB OAuth state.
+router.get('/amazon/oauth/callback', handleAmazonOAuthCallback);
+
 router.use(authMiddleware);
 router.use(tenantMiddleware);
 router.use(authorizeRoles('seller', 'admin'));
@@ -63,7 +68,6 @@ router.use(authorizeRoles('seller', 'admin'));
 // Dedicated Amazon SP-API Integration Endpoints (declared before /:id)
 router.get('/amazon/status', getAmazonConnectionStatus);
 router.get('/amazon/oauth/initiate', initiateAmazonOAuth);
-router.get('/amazon/oauth/callback', handleAmazonOAuthCallback);
 router.post('/amazon/oauth/callback', handleAmazonOAuthCallback);
 router.post('/amazon/connect-manual', connectAmazonManual);
 router.post('/amazon/disconnect', disconnectAmazon);

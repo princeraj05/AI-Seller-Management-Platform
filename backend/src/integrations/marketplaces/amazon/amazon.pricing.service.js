@@ -5,7 +5,12 @@ import { SyncHistory } from '../../../modules/channels/syncHistory.model.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
 import { AmazonSpApiClient } from './amazon.client.js';
 import { mapAmazonOffersToPricing } from './amazon.pricing.mapper.js';
-import { inMemoryChannelsMap } from '../../../modules/channels/channel.service.js';
+import {
+  inMemoryChannelsMap,
+  buildTenantConnectionQuery,
+  matchesTenantStore,
+} from '../../../modules/channels/channel.service.js';
+import { isProductionEnv } from '../../../config/storage.js';
 
 // In-memory fallback map for pricing testing
 export const inMemoryPricingMap = new Map();
@@ -96,20 +101,28 @@ export const getListingOffers = async (client, sku, options = {}) => {
  * @returns {Promise<Object>}
  */
 export const syncAmazonPricingService = async (tenant, options = {}) => {
-  const { sellerId } = tenant;
+  const { sellerId, storeId = null } = tenant;
   const startedAt = new Date();
 
-  // 1. Verify channel connection
+  // 1. Verify channel connection (sellerId + storeId scoped)
   let connection = null;
   try {
-    connection = await withDbTimeout(ChannelConnection.findOne({ sellerId, provider: 'AMAZON' }), 1000);
+    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
+    connection = await withDbTimeout(ChannelConnection.findOne(connQuery), 1000);
   } catch (e) {
-    // fallback
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to verify Amazon connection in MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
   }
 
-  if (!connection) {
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
-      (c) => c.sellerId?.toString() === sellerId?.toString() && c.provider === 'AMAZON'
+      (c) =>
+        matchesTenantStore(c, { sellerId, storeId }) &&
+        (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
 
@@ -130,6 +143,7 @@ export const syncAmazonPricingService = async (tenant, options = {}) => {
   const region = connection.marketplaceRegion || 'eu';
 
   const client = new AmazonSpApiClient({
+    sellerId: sellerId ? sellerId.toString() : null,
     refreshToken: decrypted.refreshToken,
     region,
     marketplaceId,

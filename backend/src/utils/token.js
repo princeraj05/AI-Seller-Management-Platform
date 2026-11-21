@@ -79,6 +79,10 @@ export const generateRefreshToken = async (user, family = null) => {
     });
   } catch (error) {
     console.error('Failed to persist refresh token:', error.message);
+    const persistErr = new Error('Unable to persist authentication session. Please try again.');
+    persistErr.code = 'REFRESH_TOKEN_PERSISTENCE_FAILED';
+    persistErr.status = 503;
+    throw persistErr;
   }
 
   return { refreshToken, family: tokenFamily, expiresAt };

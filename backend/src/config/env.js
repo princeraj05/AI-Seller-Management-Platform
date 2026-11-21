@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { validateEncryptionConfig } from '../utils/encryption.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,6 +95,9 @@ if (isProduction) {
   }
 }
 
+// Validate credential encryption key configuration at startup (fail fast in production)
+validateEncryptionConfig(process.env);
+
 // Regional Selling Partner API Endpoints (India-first uses Europe region 'eu')
 export const SP_API_REGIONS = {
   na: {
@@ -160,6 +164,8 @@ export const config = {
     env: process.env.AMAZON_SP_API_ENV || 'sandbox',
     region: (process.env.AMAZON_SP_API_REGION || 'eu').toLowerCase().trim(),
     refreshToken: process.env.AMAZON_SP_API_REFRESH_TOKEN || '',
+    redirectUri: (process.env.AMAZON_SP_API_REDIRECT_URI || '').trim(),
+    indiaMarketplaceId: 'A21TJRUUN4KGV',
     endpoint: resolveSpApiEndpoint(
       process.env.AMAZON_SP_API_REGION || 'eu',
       process.env.AMAZON_SP_API_ENV || 'sandbox'

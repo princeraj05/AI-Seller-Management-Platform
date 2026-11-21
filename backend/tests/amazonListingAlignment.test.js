@@ -490,8 +490,10 @@ async function runSuite() {
       }
       assert.strictEqual(rejected503, true, 'Production MongoDB query failure must return 503 Service Unavailable');
 
-      // 7B: When MongoDB query resolves to null, product is not found (404) without in-memory fallback
+      // 7B: When submission exists in MongoDB but Product query resolves to null, product is not found (404) without in-memory fallback
+      const origSubFindOne = MarketplaceListingSubmission.findOne;
       const origFindOne = Product.findOne;
+      MarketplaceListingSubmission.findOne = async () => prodSub;
       Product.findOne = async () => null;
       let rejected404 = false;
       try {
@@ -504,6 +506,7 @@ async function runSuite() {
         assert.strictEqual(e.code, 'PRODUCT_NOT_FOUND');
         assert.strictEqual(e.status, 404);
       } finally {
+        MarketplaceListingSubmission.findOne = origSubFindOne;
         Product.findOne = origFindOne;
       }
       assert.strictEqual(rejected404, true, 'Production must reject unpersisted products with 404 without in-memory fallback');
@@ -661,9 +664,24 @@ async function runSuite() {
     });
     inMemorySubmissionsMap.set('sub-immut-02', subSandbox);
 
+    const mockSandboxClient = {
+      credentials: { sellingPartnerId: 'A2IMMUTTEST1', marketplaceId: 'A21TJRUUN4KGV' },
+      executeRequest: async (_ep, opts) => {
+        if (opts?.method === 'PUT') {
+          return {
+            status: 'ACCEPTED',
+            submissionId: 'amzn-sub-immut-02',
+            issues: [],
+            _metadata: { status: 200, requestId: 'req-immut-02' },
+          };
+        }
+        return {};
+      },
+    };
+
     const sandboxResult = await executeListingSubmission(
       { submissionId: 'sub-immut-02', dryRun: false },
-      { tenant: { sellerId: 'seller-immut-01', storeId: 'store-immut-01' } }
+      { tenant: { sellerId: 'seller-immut-01', storeId: 'store-immut-01' }, client: mockSandboxClient }
     );
     assert.strictEqual(sandboxResult.success, true);
 

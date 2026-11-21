@@ -5,7 +5,12 @@ import { SyncHistory } from '../../../modules/channels/syncHistory.model.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
 import { AmazonSpApiClient } from './amazon.client.js';
 import { mapFbaInventorySummary, mapFbmInventoryItem } from './amazon.inventory.mapper.js';
-import { inMemoryChannelsMap, buildTenantConnectionQuery } from '../../../modules/channels/channel.service.js';
+import {
+  inMemoryChannelsMap,
+  buildTenantConnectionQuery,
+  matchesTenantStore,
+} from '../../../modules/channels/channel.service.js';
+import { isProductionEnv } from '../../../config/storage.js';
 
 // In-memory fallback map for inventory testing
 export const inMemoryInventoryMap = new Map();
@@ -153,20 +158,25 @@ export const syncAmazonInventoryService = async (tenant, options = {}) => {
   const { sellerId } = tenant;
   const startedAt = new Date();
 
-  // 1. Verify channel connection with robust tenant/sellerId query
-  const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON');
+  // 1. Verify channel connection with robust tenant/sellerId + storeId query
+  const storeId = tenant?.storeId || null;
+  const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
   let connection = null;
   try {
     connection = await withDbTimeout(ChannelConnection.findOne(connQuery), 1500);
   } catch (e) {
-    // fallback
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to verify Amazon connection in MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
   }
 
-  if (!connection) {
-    const sellerIdStr = sellerId ? sellerId.toString() : '';
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
       (c) =>
-        (c.sellerId?.toString() === sellerIdStr || c.tenantId?.toString() === sellerIdStr) &&
+        matchesTenantStore(c, { sellerId, storeId }) &&
         (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
@@ -193,8 +203,9 @@ export const syncAmazonInventoryService = async (tenant, options = {}) => {
   const marketplaceId = options.marketplaceId || connection.marketplaceId || 'A21TJRUUN4KGV';
   const region = connection.marketplaceRegion || 'eu';
 
-  // 2. Initialize client
+  // 2. Initialize tenant-scoped client
   const client = new AmazonSpApiClient({
+    sellerId: sellerId ? sellerId.toString() : null,
     refreshToken: decrypted.refreshToken,
     region,
     marketplaceId,

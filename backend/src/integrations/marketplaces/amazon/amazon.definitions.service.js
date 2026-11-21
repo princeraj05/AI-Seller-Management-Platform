@@ -5,6 +5,29 @@
  * Strictly read-only operations.
  */
 
+import { AMAZON_EXECUTION_OUTCOMES } from './amazon.client.js';
+
+const DEFINITIONS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const productTypesSearchCache = new Map();
+const productTypeSchemaCache = new Map();
+
+export const clearDefinitionsCache = () => {
+  productTypesSearchCache.clear();
+  productTypeSchemaCache.clear();
+};
+
+const normalizeProductTypeEntry = (pt) => {
+  if (!pt || typeof pt !== 'object') return null;
+  const code = String(pt.name || pt.productType || '').trim().toUpperCase();
+  if (!code) return null;
+  return {
+    ...pt,
+    name: code,
+    productType: code,
+    displayName: pt.displayName || code,
+  };
+};
+
 // Official Standard Amazon India Product Types & Schema Definitions (Development Fallback)
 // Used with explicit labeling if the Amazon SP-API Sandbox has unprovisioned dynamic definitions
 export const FALLBACK_PRODUCT_TYPES = [
@@ -271,22 +294,47 @@ export const FALLBACK_SCHEMAS = {
  */
 export const searchProductTypes = async (client, options = {}) => {
   const marketplaceId = options.marketplaceId || client?.credentials?.marketplaceId || 'A21TJRUUN4KGV';
+  const keywords = options.keywords && options.keywords.trim() ? options.keywords.trim() : '';
+  const hasLiveClient = Boolean(client && typeof client.executeRequest === 'function');
+  const cacheKey = `${hasLiveClient ? 'LIVE' : 'FALLBACK'}:${marketplaceId}:${keywords.toLowerCase()}`;
+
+  if (!options.bypassCache) {
+    const cached = productTypesSearchCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return { ...cached.data, cached: true };
+    }
+  }
+
   const queryParams = new URLSearchParams({ marketplaceIds: marketplaceId });
-  if (options.keywords && options.keywords.trim()) {
-    queryParams.set('keywords', options.keywords.trim());
+  if (keywords) {
+    queryParams.set('keywords', keywords);
   }
 
   const endpointPath = `/definitions/2020-09-01/productTypes?${queryParams.toString()}`;
 
-  if (client && typeof client.executeRequest === 'function') {
+  if (hasLiveClient) {
     try {
-      const responseData = await client.executeRequest(endpointPath);
+      const responseData = await client.executeRequest(endpointPath, {
+        method: 'GET',
+        operation: 'searchDefinitionsProductTypes',
+      });
       if (responseData && Array.isArray(responseData.productTypes) && responseData.productTypes.length > 0) {
-        return {
-          productTypes: responseData.productTypes,
+        const normalizedTypes = responseData.productTypes
+          .map(normalizeProductTypeEntry)
+          .filter(Boolean);
+        const liveResult = {
+          productTypes: normalizedTypes,
           source: 'AMAZON_SP_API',
           marketplaceId,
+          executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+          diagnostics: responseData._metadata || (typeof client.getLastRequestDiagnostics === 'function' ? client.getLastRequestDiagnostics() : null),
+          cached: false,
         };
+        productTypesSearchCache.set(cacheKey, {
+          data: liveResult,
+          expiresAt: Date.now() + DEFINITIONS_CACHE_TTL_MS,
+        });
+        return liveResult;
       }
     } catch (apiErr) {
       console.warn(`[Amazon SP-API Diagnostics] Product Type Definitions search warning: ${apiErr.message}`);
@@ -295,25 +343,29 @@ export const searchProductTypes = async (client, options = {}) => {
 
   // Graceful development fallback with transparent labeling
   let filtered = FALLBACK_PRODUCT_TYPES;
-  if (options.keywords && options.keywords.trim()) {
-    const kw = options.keywords.toLowerCase().trim();
+  if (keywords) {
+    const kw = keywords.toLowerCase();
     filtered = FALLBACK_PRODUCT_TYPES.filter(
       (pt) => pt.name.toLowerCase().includes(kw) || pt.displayName.toLowerCase().includes(kw) || pt.category.toLowerCase().includes(kw)
     );
   }
 
-  return {
-    productTypes: filtered,
+  const fallbackResult = {
+    productTypes: filtered.map(normalizeProductTypeEntry).filter(Boolean),
     source: 'DEVELOPMENT_FALLBACK',
     marketplaceId,
-    note: 'Showing official Amazon India product types via development fallback. Amazon Sandbox does not provide dynamic definitions.',
+    executionOutcome: AMAZON_EXECUTION_OUTCOMES.MOCK,
+    cached: false,
+    note: 'Showing official Amazon India product types via development fallback. Connect Amazon Sandbox or ensure dynamic definitions are provisioned.',
   };
+
+  return fallbackResult;
 };
 
 /**
- * Get dynamic schema definition for a single product type
+ * Get dynamic schema definition for a single product type (with 30-min TTL caching)
  *
- * @param {import('./amazon.client.js').AmazonSpApiClient} client
+ * @param {import('./amazon.client.js').AmazonSpApiClient} clientOrType
  * @param {string} productType e.g. 'SHIRT', 'SHOES', 'BAG'
  * @param {Object} [options]
  * @param {string} [options.marketplaceId='A21TJRUUN4KGV']
@@ -333,6 +385,15 @@ export const getProductTypeDefinition = async (clientOrType, productType, option
 
   const cleanType = productType.trim().toUpperCase();
   const marketplaceId = options.marketplaceId || client?.credentials?.marketplaceId || 'A21TJRUUN4KGV';
+  const hasLiveClient = Boolean(client && typeof client.executeRequest === 'function');
+  const cacheKey = `${hasLiveClient ? 'LIVE' : 'FALLBACK'}:${marketplaceId}:${cleanType}`;
+
+  if (!options.bypassCache) {
+    const cached = productTypeSchemaCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return { ...cached.data, cached: true };
+    }
+  }
 
   const queryParams = new URLSearchParams({
     marketplaceIds: marketplaceId,
@@ -342,18 +403,35 @@ export const getProductTypeDefinition = async (clientOrType, productType, option
 
   const endpointPath = `/definitions/2020-09-01/productTypes/${encodeURIComponent(cleanType)}?${queryParams.toString()}`;
 
-  if (client && typeof client.executeRequest === 'function') {
+  if (hasLiveClient) {
     try {
-      const responseData = await client.executeRequest(endpointPath);
-      if (responseData && responseData.schema) {
-        return {
+      const responseData = await client.executeRequest(endpointPath, {
+        method: 'GET',
+        operation: 'getDefinitionsProductType',
+      });
+      if (responseData && (responseData.schema || responseData.properties)) {
+        const liveSchema = {
           productType: cleanType,
           schemaSource: 'AMAZON_SP_API',
           marketplaceId,
-          schema: responseData.schema,
+          schema: responseData.schema || null,
+          properties: responseData.schema?.properties || responseData.properties || {},
+          requiredAttributes: Array.isArray(responseData.schema?.required)
+            ? responseData.schema.required
+            : Array.isArray(responseData.requiredAttributes)
+            ? responseData.requiredAttributes
+            : [],
           requirements: responseData.requirements || 'LISTING',
           productTypeVersion: responseData.productTypeVersion || 'LATEST',
+          executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+          diagnostics: responseData._metadata || (typeof client.getLastRequestDiagnostics === 'function' ? client.getLastRequestDiagnostics() : null),
+          cached: false,
         };
+        productTypeSchemaCache.set(cacheKey, {
+          data: liveSchema,
+          expiresAt: Date.now() + DEFINITIONS_CACHE_TTL_MS,
+        });
+        return liveSchema;
       }
     } catch (apiErr) {
       console.warn(`[Amazon SP-API Diagnostics] Product Type schema fetch warning for ${cleanType}: ${apiErr.message}`);
@@ -381,5 +459,150 @@ export const getProductTypeDefinition = async (clientOrType, productType, option
     note: `Generic fallback schema for ${cleanType}. Official Amazon Sandbox does not provide dynamic definitions for this type.`,
   };
 
-  return fallback;
+  return {
+    ...fallback,
+    executionOutcome: AMAZON_EXECUTION_OUTCOMES.MOCK,
+    cached: false,
+  };
+};
+
+/**
+ * Validate an SP-API Listings Items payload against a retrieved JSON Schema or normalized fallback schema.
+ *
+ * @param {Object} spApiPayload { productType, requirements, attributes }
+ * @param {Object} schemaDef Output from getProductTypeDefinition()
+ * @returns {{ valid: boolean, errors: Array, warnings: Array, schemaSource: string }}
+ */
+export const validatePayloadAgainstProductTypeSchema = (spApiPayload, schemaDef) => {
+  const errors = [];
+  const warnings = [];
+  const schemaSource = schemaDef?.schemaSource || 'UNKNOWN';
+  const attrs = spApiPayload?.attributes || {};
+
+  if (!schemaDef || typeof schemaDef !== 'object') {
+    return { valid: true, errors, warnings, schemaSource };
+  }
+
+  // Normalize JSON Schema (official SP-API) or fallback schema properties
+  const jsonSchema = schemaDef.schema && typeof schemaDef.schema === 'object' ? schemaDef.schema : null;
+  const props = jsonSchema?.properties || schemaDef.properties || {};
+  const requiredFields = Array.isArray(jsonSchema?.required)
+    ? jsonSchema.required
+    : Array.isArray(schemaDef.requiredAttributes)
+    ? schemaDef.requiredAttributes
+    : [];
+
+  // Map friendly fallback names to SP-API v2021-08-01 attribute keys
+  const resolveAttrValue = (field) => {
+    if (field === 'standard_price') {
+      return attrs.purchasable_offer?.[0]?.our_price?.[0]?.schedule?.[0]?.value_with_tax;
+    }
+    if (field === 'quantity') {
+      return attrs.fulfillment_availability?.[0]?.quantity;
+    }
+    if (field === 'main_image') {
+      return attrs.main_product_image_locator?.[0]?.media_location;
+    }
+    if (field === 'bullet_point') {
+      return Array.isArray(attrs.bullet_point) ? attrs.bullet_point.map((b) => b.value).filter(Boolean) : [];
+    }
+    const raw = attrs[field];
+    if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'object' && raw[0] !== null && 'value' in raw[0]) {
+      return raw[0].value;
+    }
+    return raw;
+  };
+
+  // 1. Required attribute presence
+  for (const field of requiredFields) {
+    const val = resolveAttrValue(field);
+    const isMissing =
+      val === undefined ||
+      val === null ||
+      (typeof val === 'string' && val.trim() === '') ||
+      (Array.isArray(val) && val.length === 0);
+
+    if (isMissing) {
+      errors.push({
+        attribute: field,
+        code: 'SCHEMA_REQUIRED_ATTRIBUTE_MISSING',
+        severity: 'ERROR',
+        message: `Schema (${schemaSource}) requires attribute "${field}" for product type ${schemaDef.productType || spApiPayload?.productType}.`,
+      });
+    }
+  }
+
+  // 2. Property constraint checks (type, minLength, maxLength, minimum, minItems, maxItems, enum)
+  for (const [field, rules] of Object.entries(props)) {
+    if (!rules || typeof rules !== 'object') continue;
+    const val = resolveAttrValue(field);
+    if (val === undefined || val === null || val === '') continue;
+
+    if (typeof val === 'string') {
+      if (typeof rules.minLength === 'number' && val.trim().length < rules.minLength) {
+        warnings.push({
+          attribute: field,
+          code: 'SCHEMA_MIN_LENGTH',
+          severity: 'WARNING',
+          message: `Attribute "${field}" is shorter than recommended minimum length (${rules.minLength}).`,
+        });
+      }
+      if (typeof rules.maxLength === 'number' && val.trim().length > rules.maxLength) {
+        errors.push({
+          attribute: field,
+          code: 'SCHEMA_MAX_LENGTH',
+          severity: 'ERROR',
+          message: `Attribute "${field}" exceeds schema maxLength (${rules.maxLength}).`,
+        });
+      }
+      if (Array.isArray(rules.enum) && rules.enum.length > 0) {
+        const lowerEnum = rules.enum.map((e) => String(e).toLowerCase());
+        if (!lowerEnum.includes(val.trim().toLowerCase())) {
+          warnings.push({
+            attribute: field,
+            code: 'SCHEMA_ENUM_MISMATCH',
+            severity: 'WARNING',
+            message: `Attribute "${field}" value "${val}" is not in schema allowed enum values.`,
+          });
+        }
+      }
+    }
+
+    if (typeof val === 'number') {
+      if (typeof rules.minimum === 'number' && val < rules.minimum) {
+        errors.push({
+          attribute: field,
+          code: 'SCHEMA_MINIMUM_VIOLATION',
+          severity: 'ERROR',
+          message: `Attribute "${field}" (${val}) is below schema minimum (${rules.minimum}).`,
+        });
+      }
+      if (rules.type === 'integer' && !Number.isInteger(val)) {
+        errors.push({
+          attribute: field,
+          code: 'SCHEMA_INTEGER_REQUIRED',
+          severity: 'ERROR',
+          message: `Attribute "${field}" must be an integer.`,
+        });
+      }
+    }
+
+    if (Array.isArray(val)) {
+      if (typeof rules.maxItems === 'number' && val.length > rules.maxItems) {
+        errors.push({
+          attribute: field,
+          code: 'SCHEMA_MAX_ITEMS',
+          severity: 'ERROR',
+          message: `Attribute "${field}" has ${val.length} items, exceeding schema maxItems (${rules.maxItems}).`,
+        });
+      }
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    schemaSource,
+  };
 };

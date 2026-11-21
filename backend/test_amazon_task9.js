@@ -366,12 +366,14 @@ runAsyncTest('11. Sandbox submission with VALIDATION_PREVIEW: Safely invokes SP-
   let bodySent = null;
 
   const mockClient = {
-    credentials: { marketplaceId: 'A21TJRUUN4KGV' },
+    credentials: { sellingPartnerId: 'A2TESTMERCHANT1', marketplaceId: 'A21TJRUUN4KGV' },
     lastRequestId: 'amzn-req-valpreview-999',
     executeRequest: async (endpoint, opts) => {
-      endpointCalled = endpoint;
-      methodCalled = opts?.method;
-      bodySent = JSON.parse(opts?.body || '{}');
+      if (opts?.method === 'PUT') {
+        endpointCalled = endpoint;
+        methodCalled = opts?.method;
+        bodySent = JSON.parse(opts?.body || '{}');
+      }
       return {
         submissionId: 'amzn-sub-val-preview-12345',
         status: 'VALIDATION_PREVIEW_SUCCESS',

@@ -37,25 +37,37 @@ export const authMiddleware = async (req, res, next) => {
       try {
         const decodedFirebaseToken = await adminAuth.verifyIdToken(token);
         if (decodedFirebaseToken && decodedFirebaseToken.uid) {
-          const { uid, email, name, picture } = decodedFirebaseToken;
+          const { uid, email, name, picture, email_verified: emailVerified } = decodedFirebaseToken;
 
-          let user = await User.findOne({
-            $or: [{ firebaseUid: uid }, { email: email?.toLowerCase() }],
-          });
+          const normalizedEmail = email ? email.toLowerCase().trim() : null;
 
-          if (!user && email) {
-            // Auto-provision verified Firebase account
-            user = await User.create({
-              firebaseUid: uid,
-              email: email.toLowerCase(),
-              name: name || email.split('@')[0],
-              avatar: picture || '',
-              role: 'seller',
-              isActive: true,
-            });
-          } else if (user && !user.firebaseUid) {
-            user.firebaseUid = uid;
-            await user.save();
+          // Match first by verified Firebase UID; only match/link by email when email_verified is strictly true
+          let user = await User.findOne({ firebaseUid: uid });
+
+          if (!user && normalizedEmail) {
+            if (emailVerified !== true) {
+              return res.status(403).json({
+                success: false,
+                message: 'Email address must be verified with your identity provider before linking or accessing this account.',
+                code: 'EMAIL_NOT_VERIFIED',
+              });
+            }
+
+            user = await User.findOne({ email: normalizedEmail });
+            if (user) {
+              user.firebaseUid = uid;
+              await user.save();
+            } else {
+              // Auto-provision verified Firebase account
+              user = await User.create({
+                firebaseUid: uid,
+                email: normalizedEmail,
+                name: name || normalizedEmail.split('@')[0],
+                avatar: picture || '',
+                role: 'seller',
+                isActive: true,
+              });
+            }
           }
 
           if (user && user.isActive === false) {

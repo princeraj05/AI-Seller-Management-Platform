@@ -6,7 +6,11 @@ import { Product } from '../../../modules/products/product.model.js';
 import { ChannelConnection } from '../../../modules/channels/channelConnection.model.js';
 import { inMemoryChannelsMap, buildTenantConnectionQuery } from '../../../modules/channels/channel.service.js';
 import { decryptCredentials } from '../../../utils/encryption.js';
-import { AmazonSpApiClient } from './amazon.client.js';
+import { AmazonSpApiClient, AMAZON_EXECUTION_OUTCOMES } from './amazon.client.js';
+import {
+  getProductTypeDefinition,
+  validatePayloadAgainstProductTypeSchema,
+} from './amazon.definitions.service.js';
 import { config } from '../../../config/env.js';
 import { isProductionEnv } from '../../../config/storage.js';
 import { inMemoryProductsMap } from '../../../modules/products/product.service.js';
@@ -618,23 +622,65 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
     throw prodErr;
   }
 
-  // 2. Fetch or resolve Submission Record
+  // 2. Fetch or resolve Submission Record with strict tenant & store isolation
   let submission = typeof submissionId === 'object' && submissionId !== null ? submissionId : null;
   const sellerId = tenant?.sellerId || tenant?._id || submission?.sellerId;
+  const reqStoreId = tenant?.storeId ? String(tenant.storeId) : null;
 
-  if (!submission) {
-    try {
-      submission = await MarketplaceListingSubmission.findOne({
-        _id: submissionId,
-        sellerId,
-      });
-    } catch (dbErr) {
-      submission = inMemorySubmissionsMap.get(String(submissionId));
+  if (submission && sellerId) {
+    if (submission.sellerId && String(submission.sellerId) !== String(sellerId)) {
+      const authErr = new Error('Cross-tenant listing submission access forbidden.');
+      authErr.code = 'UNAUTHORIZED_ACCESS';
+      authErr.status = 403;
+      throw authErr;
+    }
+    const subStore = submission.storeId ? String(submission.storeId) : null;
+    if (subStore !== reqStoreId && tenant?.storeId !== undefined) {
+      const storeErr = new Error('Cross-store listing submission access forbidden.');
+      storeErr.code = 'UNAUTHORIZED_ACCESS';
+      storeErr.status = 403;
+      throw storeErr;
     }
   }
 
-  if (!submission && inMemorySubmissionsMap.has(String(submissionId))) {
-    submission = inMemorySubmissionsMap.get(String(submissionId));
+  if (!submission) {
+    try {
+      const subQuery = {
+        _id: submissionId,
+        sellerId,
+      };
+      if (reqStoreId) {
+        subQuery.storeId = reqStoreId;
+      }
+      submission = await MarketplaceListingSubmission.findOne(subQuery);
+    } catch (dbErr) {
+      if (isProductionEnv()) {
+        const err = new Error('Service Unavailable: Listing submission store could not be reached in MongoDB.');
+        err.code = 'SERVICE_UNAVAILABLE';
+        err.status = 503;
+        throw err;
+      }
+    }
+  }
+
+  if (!submission && !isProductionEnv() && inMemorySubmissionsMap.has(String(submissionId))) {
+    const candidate = inMemorySubmissionsMap.get(String(submissionId));
+    const candSeller = candidate?.sellerId ? String(candidate.sellerId) : null;
+    const reqSeller = sellerId ? String(sellerId) : null;
+    if (candSeller && reqSeller && candSeller !== reqSeller) {
+      const authErr = new Error('Cross-tenant listing submission access forbidden.');
+      authErr.code = 'UNAUTHORIZED_ACCESS';
+      authErr.status = 403;
+      throw authErr;
+    }
+    const candStore = candidate?.storeId ? String(candidate.storeId) : null;
+    if (candStore !== reqStoreId) {
+      const storeErr = new Error('Cross-store listing submission access forbidden.');
+      storeErr.code = 'UNAUTHORIZED_ACCESS';
+      storeErr.status = 403;
+      throw storeErr;
+    }
+    submission = candidate;
   }
 
   if (!submission) {
@@ -821,6 +867,7 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       dryRunVerified: true,
       requestId: `dry-run-${Date.now()}`,
       submittedAt: new Date(),
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.DRY_RUN,
       note: 'Dry run completed successfully. Payload validated according to Amazon SP-API v2021-08-01 schemas without marketplace mutations.',
     };
 
@@ -837,9 +884,12 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       success: true,
       status: 'DRY_RUN',
       submissionMode: 'DRY_RUN',
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.DRY_RUN,
       isDryRun: true,
       submissionId: submission._id || submission.id,
       sku: submission.sellerSku,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
       productType: submission.productType,
       payloadPreview: spApiPayload,
       issues: validation.issues,
@@ -852,30 +902,43 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
   submission.submissionMode = 'SANDBOX_SUBMISSION';
   submission.lastSubmittedAt = new Date();
 
-  // If client is provided or initialize client from connection
+  // Resolve tenant-scoped Amazon connection and sellingPartnerId (NEVER substitute internal MongoDB sellerId)
   let apiClient = client;
+  let connection = null;
+  let decrypted = null;
+
   if (!apiClient) {
-    let connection = null;
     try {
-      const q = buildTenantConnectionQuery(sellerId, 'AMAZON');
+      const q = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId || null);
       connection = await ChannelConnection.findOne(q);
     } catch (e) {
-      // fallback
+      if (isProductionEnv()) {
+        const dbErr = new Error('Service Unavailable: Unable to load Amazon channel connection from MongoDB.');
+        dbErr.code = 'SERVICE_UNAVAILABLE';
+        dbErr.status = 503;
+        throw dbErr;
+      }
     }
 
-    if (!connection) {
+    if (!connection && !isProductionEnv()) {
       const sellerIdStr = sellerId ? sellerId.toString() : '';
+      const storeIdStr = storeId ? storeId.toString() : null;
       connection = Array.from(inMemoryChannelsMap.values()).find(
         (c) =>
           (c.sellerId?.toString() === sellerIdStr || c.tenantId?.toString() === sellerIdStr) &&
-          (c.provider === 'AMAZON' || c.channel === 'amazon')
+          (c.provider === 'AMAZON' || c.channel === 'amazon') &&
+          (c.storeId ? String(c.storeId) : null) === storeIdStr
       );
     }
 
-    if (connection && connection.credentials) {
-      const decrypted = decryptCredentials(connection.credentials);
+    if (connection && connection.status === 'CONNECTED' && connection.credentials) {
+      decrypted = decryptCredentials(connection.credentials);
       if (decrypted && decrypted.refreshToken) {
+        const connSellingPartnerId =
+          connection.sellingPartnerId || connection.externalAccountId || decrypted.sellingPartnerId || null;
         apiClient = new AmazonSpApiClient({
+          sellerId: sellerId ? sellerId.toString() : null,
+          sellingPartnerId: connSellingPartnerId,
           refreshToken: decrypted.refreshToken,
           region: connection.marketplaceRegion || 'eu',
           marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
@@ -883,6 +946,153 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
         });
       }
     }
+  }
+
+  // Strictly fail when Sandbox credentials / client are unavailable — NEVER silently return fake DRY_RUN_COMPLETED success
+  if (!apiClient || typeof apiClient.executeRequest !== 'function') {
+    submission.status = 'FAILED';
+    submission.amazonSubmissionId = null;
+    submission.responseMetadata = {
+      httpStatus: 400,
+      requestId: null,
+      submittedAt: new Date(),
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      errorCode: 'AMAZON_CREDENTIALS_MISSING',
+      note: 'Active Amazon Sandbox connection and verified seller credentials are required for Sandbox submission.',
+    };
+
+    try {
+      await submission.save();
+    } catch (e) {
+      if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
+    }
+
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
+    return {
+      success: false,
+      status: 'FAILED',
+      isDryRun: false,
+      submissionId: submission._id || submission.id,
+      amazonSubmissionId: null,
+      sku: submission.sellerSku,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+      submissionMode: submission.submissionMode,
+      productType: submission.productType,
+      payloadPreview: spApiPayload,
+      issues: validation.issues,
+      errorCode: 'AMAZON_CREDENTIALS_MISSING',
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      message: 'Amazon Sandbox submission failed: no active verified Amazon Sandbox connection/credentials available.',
+      responseMetadata: submission.responseMetadata,
+    };
+  }
+
+  // Resolve official Amazon Merchant Token (sellingPartnerId) — NEVER fall back to internal MongoDB sellerId
+  const amazonSellingPartnerId = String(
+    connection?.sellingPartnerId ||
+      connection?.externalAccountId ||
+      decrypted?.sellingPartnerId ||
+      apiClient?.credentials?.sellingPartnerId ||
+      arg1?.sellingPartnerId ||
+      arg2?.sellingPartnerId ||
+      submission?.sellingPartnerId ||
+      ''
+  ).trim();
+
+  const isMockSellingPartnerId =
+    !amazonSellingPartnerId ||
+    /^(mock|sandbox_mock|fake|placeholder)/i.test(amazonSellingPartnerId) ||
+    (connection?.verificationMode === 'SANDBOX_STATIC_MOCK' && connection?.sellerAuthorizationVerified === false);
+
+  if (isMockSellingPartnerId) {
+    submission.status = 'FAILED';
+    submission.amazonSubmissionId = null;
+    submission.responseMetadata = {
+      httpStatus: 400,
+      requestId: null,
+      submittedAt: new Date(),
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      errorCode: 'MISSING_SELLING_PARTNER_ID',
+      note: 'A real verified Amazon sellingPartnerId (Merchant Token) is required for Listings Items PUT API. Internal sellerId and Sandbox static mock identities cannot be substituted.',
+    };
+
+    try {
+      await submission.save();
+    } catch (e) {
+      if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
+    }
+
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
+    return {
+      success: false,
+      status: 'FAILED',
+      isDryRun: false,
+      submissionId: submission._id || submission.id,
+      amazonSubmissionId: null,
+      sku: submission.sellerSku,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+      submissionMode: submission.submissionMode,
+      productType: submission.productType,
+      payloadPreview: spApiPayload,
+      issues: validation.issues,
+      errorCode: 'MISSING_SELLING_PARTNER_ID',
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      message: 'Verified Amazon sellingPartnerId (Merchant Token) is required. Reconnect Amazon to bind sellingPartnerId.',
+      responseMetadata: submission.responseMetadata,
+    };
+  }
+
+  // Schema validation against Product Type Definition (cached)
+  let schemaValidation = { valid: true, errors: [], warnings: [], schemaSource: 'UNKNOWN' };
+  try {
+    const schemaDef = await getProductTypeDefinition(apiClient, submission.productType, {
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+    });
+    schemaValidation = validatePayloadAgainstProductTypeSchema(spApiPayload, schemaDef);
+  } catch {
+    // Non-blocking if schema fetch itself throws
+  }
+
+  if (!schemaValidation.valid) {
+    submission.status = 'VALIDATION_FAILED';
+    submission.amazonSubmissionId = null;
+    submission.issues = [...(validation.issues || []), ...schemaValidation.errors, ...schemaValidation.warnings];
+    submission.responseMetadata = {
+      httpStatus: 400,
+      requestId: null,
+      submittedAt: new Date(),
+      schemaSource: schemaValidation.schemaSource,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      errorCode: 'SCHEMA_VALIDATION_FAILED',
+    };
+
+    try {
+      await submission.save();
+    } catch (e) {
+      if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
+    }
+
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
+    return {
+      success: false,
+      status: 'VALIDATION_FAILED',
+      isDryRun: false,
+      amazonSubmissionId: null,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+      submissionMode: submission.submissionMode,
+      issues: submission.issues,
+      errorCode: 'SCHEMA_VALIDATION_FAILED',
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      payloadPreview: spApiPayload,
+      responseMetadata: submission.responseMetadata,
+      message: 'Listing payload failed Amazon Product Type JSON Schema validation.',
+    };
   }
 
   const queryParams = new URLSearchParams({
@@ -899,61 +1109,48 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
     queryParams.set('mode', 'VALIDATION_PREVIEW');
   }
 
-  const endpointPath = `/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(submission.sellerSku)}?${queryParams.toString()}`;
+  // Strictly use Amazon's sellingPartnerId (Merchant Token) in the Listings Items PUT URL
+  const endpointPath = `/listings/2021-08-01/items/${encodeURIComponent(amazonSellingPartnerId)}/${encodeURIComponent(submission.sellerSku)}?${queryParams.toString()}`;
 
-  if (apiClient && typeof apiClient.executeRequest === 'function') {
-    try {
-      const amazonResponse = await apiClient.executeRequest(endpointPath, {
-        method: 'PUT',
-        body: JSON.stringify(spApiPayload),
-      });
+  try {
+    const amazonResponse = await apiClient.executeRequest(endpointPath, {
+      method: 'PUT',
+      operation: 'putListingsItem',
+      body: JSON.stringify(spApiPayload),
+    });
 
-      const submissionIdResult =
-        amazonResponse.submissionId ||
-        amazonResponse.payload?.submissionId ||
-        amazonResponse.data?.submissionId ||
-        null;
+    const submissionIdResult =
+      amazonResponse.submissionId ||
+      amazonResponse.payload?.submissionId ||
+      amazonResponse.data?.submissionId ||
+      null;
+
+    const amazonStatus = amazonResponse.status ? String(amazonResponse.status).toUpperCase().trim() : null;
+    const amazonIssues = Array.isArray(amazonResponse.issues) ? amazonResponse.issues : [];
+    const hasBlockingErrorIssue = amazonIssues.some(
+      (issue) => String(issue?.severity || '').toUpperCase() === 'ERROR'
+    );
+
+    // CRITICAL: Amazon Listings Items API returns HTTP 200 even when status === 'INVALID'
+    if (amazonStatus === 'INVALID' || hasBlockingErrorIssue) {
       submission.amazonSubmissionId = submissionIdResult;
-      submission.status = 'SANDBOX_SUBMITTED';
+      submission.status = 'REJECTED';
+      submission.issues = amazonIssues;
       submission.responseMetadata = {
         httpStatus: amazonResponse._metadata?.status || 200,
         requestId: amazonResponse._metadata?.requestId || apiClient.lastRequestId || null,
+        amazonStatus: amazonStatus || 'INVALID',
+        sellingPartnerId: amazonSellingPartnerId,
+        schemaSource: schemaValidation.schemaSource,
+        executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
         submittedAt: new Date(),
-        note: 'Submitted to Amazon SP-API Sandbox.',
+        note: 'Amazon SP-API Sandbox returned HTTP 200 with status INVALID or blocking ERROR issues.',
       };
 
       try {
         await submission.save();
       } catch (e) {
-        inMemorySubmissionsMap.set(String(submissionId), submission);
-      }
-
-      assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
-
-      return {
-        success: true,
-        status: 'SANDBOX_SUBMITTED',
-        isDryRun: false,
-        amazonSubmissionId: submissionIdResult,
-        payloadPreview: spApiPayload,
-        responseMetadata: submission.responseMetadata,
-        issues: amazonResponse.issues || [],
-        message: 'Listing successfully submitted to Amazon SP-API Sandbox.',
-      };
-    } catch (apiErr) {
-      submission.status = 'REJECTED';
-      submission.responseMetadata = {
-        httpStatus: apiErr.status || 500,
-        requestId: apiErr.requestId || apiClient?.lastRequestId || null,
-        submittedAt: new Date(),
-        error: apiErr.message,
-        note: 'Amazon SP-API Sandbox rejected the listing request.',
-      };
-
-      try {
-        await submission.save();
-      } catch (e) {
-        inMemorySubmissionsMap.set(String(submissionId), submission);
+        if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
       }
 
       assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
@@ -961,44 +1158,96 @@ export const executeListingSubmission = async (arg1 = {}, arg2 = {}) => {
       return {
         success: false,
         status: 'REJECTED',
+        amazonStatus: amazonStatus || 'INVALID',
         isDryRun: false,
-        error: apiErr.message,
-        errorCode: apiErr.code || 'SANDBOX_SUBMISSION_FAILED',
-        responseMetadata: submission.responseMetadata,
+        amazonSubmissionId: submissionIdResult,
+        sku: submission.sellerSku,
+        sellerSku: submission.sellerSku,
+        marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+        submissionMode: submission.submissionMode,
         payloadPreview: spApiPayload,
-        message: `Amazon Sandbox rejected listing: ${apiErr.message}`,
+        responseMetadata: submission.responseMetadata,
+        issues: amazonIssues,
+        errorCode: 'AMAZON_LISTING_INVALID',
+        executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+        message: 'Amazon SP-API Sandbox rejected listing payload (status: INVALID). Review returned issues.',
       };
     }
+
+    submission.amazonSubmissionId = submissionIdResult;
+    submission.status = 'SANDBOX_SUBMITTED';
+    submission.issues = amazonIssues;
+    submission.responseMetadata = {
+      httpStatus: amazonResponse._metadata?.status || 200,
+      requestId: amazonResponse._metadata?.requestId || apiClient.lastRequestId || null,
+      amazonStatus: amazonStatus || null,
+      sellingPartnerId: amazonSellingPartnerId,
+      schemaSource: schemaValidation.schemaSource,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+      submittedAt: new Date(),
+      note: 'Submitted to Amazon SP-API Sandbox.',
+    };
+
+    try {
+      await submission.save();
+    } catch (e) {
+      if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
+    }
+
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
+    return {
+      success: true,
+      status: 'SANDBOX_SUBMITTED',
+      amazonStatus,
+      isDryRun: false,
+      amazonSubmissionId: submissionIdResult,
+      sku: submission.sellerSku,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+      submissionMode: submission.submissionMode,
+      payloadPreview: spApiPayload,
+      responseMetadata: submission.responseMetadata,
+      issues: amazonIssues,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_SUCCESS,
+      message: 'Listing successfully submitted to Amazon SP-API Sandbox.',
+    };
+  } catch (apiErr) {
+    submission.status = 'REJECTED';
+    submission.amazonSubmissionId = null;
+    submission.responseMetadata = {
+      httpStatus: apiErr.status || 500,
+      requestId: apiErr.requestId || apiClient?.lastRequestId || null,
+      sellingPartnerId: amazonSellingPartnerId,
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      submittedAt: new Date(),
+      error: apiErr.message,
+      note: 'Amazon SP-API Sandbox rejected the listing request.',
+    };
+
+    try {
+      await submission.save();
+    } catch (e) {
+      if (!isProductionEnv()) inMemorySubmissionsMap.set(String(submissionId), submission);
+    }
+
+    assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
+
+    return {
+      success: false,
+      status: 'REJECTED',
+      isDryRun: false,
+      amazonSubmissionId: null,
+      sku: submission.sellerSku,
+      sellerSku: submission.sellerSku,
+      marketplaceId: submission.marketplaceId || 'A21TJRUUN4KGV',
+      submissionMode: submission.submissionMode,
+      error: apiErr.message,
+      errorCode: apiErr.code || 'SANDBOX_SUBMISSION_FAILED',
+      executionOutcome: AMAZON_EXECUTION_OUTCOMES.SANDBOX_HTTP_FAILURE,
+      responseMetadata: submission.responseMetadata,
+      payloadPreview: spApiPayload,
+      message: `Amazon Sandbox rejected listing: ${apiErr.message}`,
+    };
   }
-
-  // If no live client available, fallback to completed dry-run with explicit limitation notice
-  submission.submissionMode = 'DRY_RUN';
-  submission.status = 'DRY_RUN_COMPLETED';
-  submission.responseMetadata = {
-    httpStatus: 200,
-    requestId: `mock-dry-run-${Date.now()}`,
-    submittedAt: new Date(),
-    note: 'Sandbox client credentials unavailable or unprovisioned. Dry run completed with valid schema structure.',
-  };
-
-  try {
-    await submission.save();
-  } catch (e) {
-    inMemorySubmissionsMap.set(String(submissionId), submission);
-  }
-
-  assertMasterProductImmutability(masterProduct, initialMasterSnapshot);
-
-  return {
-    success: true,
-    status: 'DRY_RUN_COMPLETED',
-    isDryRun: true,
-    submissionId: submission._id || submission.id,
-    sku: submission.sellerSku,
-    productType: submission.productType,
-    payloadPreview: spApiPayload,
-    issues: validation.issues,
-    message: 'Amazon Sandbox credentials unavailable; executed complete dry-run validation instead.',
-    responseMetadata: submission.responseMetadata,
-  };
 };

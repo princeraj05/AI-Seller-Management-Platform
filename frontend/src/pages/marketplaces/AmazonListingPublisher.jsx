@@ -479,24 +479,29 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
       });
 
       setSubmissionResult(execRes);
-      if (execRes.success) {
-        if (mode === 'DRY_RUN' || execRes.data?.isDryRun || execRes.data?.status === 'DRY_RUN_COMPLETED') {
+      const execData = execRes?.data || execRes || {};
+      const execSucceeded = Boolean(execRes?.success) && execData.status !== 'REJECTED' && execData.status !== 'FAILED';
+
+      if (execSucceeded) {
+        if (mode === 'DRY_RUN' || execData.isDryRun || execData.status === 'DRY_RUN') {
           setSuccessMessage(
             '✅ Local Dry-Run Completed Successfully! The listing payload was verified against SP-API schemas without making external Amazon mutations.'
           );
         } else {
-          const amzId = execRes.data?.amazonSubmissionId;
+          const amzId = execData.amazonSubmissionId;
           setSuccessMessage(
-            `✅ Amazon Sandbox Submission Sent! HTTP ${execRes.data?.responseMetadata?.httpStatus || 200} received.${amzId ? ` Processing ID: ${amzId}` : ''}`
+            `✅ Amazon Sandbox Submission Sent! HTTP ${execData.responseMetadata?.httpStatus || 200} received.${amzId ? ` Processing ID: ${amzId}` : ''}`
           );
         }
         fetchHistory();
         if (onListingCreated) onListingCreated();
       } else {
         setErrorMessage(
-          execRes.message ||
-          (mode === 'DRY_RUN' ? 'Dry-run validation failed' : 'Amazon Sandbox rejected the listing submission')
+          execData.message ||
+          execRes?.message ||
+          (mode === 'DRY_RUN' ? 'Dry-run validation failed' : 'Amazon Sandbox rejected or could not submit the listing')
         );
+        fetchHistory();
       }
     } catch (err) {
       setErrorMessage(err.message || 'Error executing submission');
@@ -769,11 +774,15 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                     onChange={(e) => setSelectedProductType(e.target.value)}
                     className="w-full text-xs border border-slate-200 rounded-lg p-2.5 focus:outline-none focus:ring-2 focus:ring-amber-500"
                   >
-                    {(Array.isArray(productTypes) ? productTypes : []).map((pt) => (
-                      <option key={pt.productType} value={pt.productType}>
-                        {pt.displayName || pt.productType} ({pt.productType})
-                      </option>
-                    ))}
+                    <option value="">-- Select Amazon Product Type --</option>
+                    {(Array.isArray(productTypes) ? productTypes : []).map((pt) => {
+                      const ptCode = pt.name || pt.productType;
+                      return (
+                        <option key={ptCode} value={ptCode}>
+                          {pt.displayName || ptCode} ({ptCode})
+                        </option>
+                      );
+                    })}
                   </select>
                 </div>
 
@@ -1578,46 +1587,62 @@ export default function AmazonListingPublisher({ connection, onListingCreated, i
                 </div>
 
                 {/* Submission Result Display */}
-                {submissionResult && (
-                  <div className="p-4 rounded-xl border border-slate-200 bg-white shadow-xs space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Submission Response Details
-                      </span>
-                      <span className="text-[10px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-mono font-bold">
-                        STATUS: {submissionResult.data?.status || 'SUBMITTED'}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div className="p-2 bg-slate-50 rounded-lg">
-                        <span className="text-[10px] text-slate-400 block uppercase">Mode</span>
-                        <span className="font-mono font-semibold">{submissionResult.data?.submissionMode}</span>
-                      </div>
-                      <div className="p-2 bg-slate-50 rounded-lg">
-                        <span className="text-[10px] text-slate-400 block uppercase">Submission / Tracking ID</span>
-                        <span className="font-mono font-semibold truncate block">
-                          {submissionResult.data?.amazonSubmissionId || 'DRY-RUN-NO-EXTERNAL-ID'}
+                {submissionResult && (() => {
+                  const resData = submissionResult.data || submissionResult;
+                  const isSuccessOutcome = Boolean(submissionResult.success) && resData.status !== 'REJECTED' && resData.status !== 'FAILED';
+                  return (
+                    <div className="p-4 rounded-xl border border-slate-200 bg-white shadow-xs space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          {isSuccessOutcome ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          ) : (
+                            <AlertCircle className="w-4 h-4 text-rose-600" />
+                          )}
+                          Submission Response Details
+                        </span>
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                            isSuccessOutcome ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                          }`}
+                        >
+                          STATUS: {resData.status || (isSuccessOutcome ? 'SANDBOX_SUBMITTED' : 'FAILED')}
                         </span>
                       </div>
-                      <div className="p-2 bg-slate-50 rounded-lg">
-                        <span className="text-[10px] text-slate-400 block uppercase">Seller SKU</span>
-                        <span className="font-mono font-semibold">{submissionResult.data?.sellerSku}</span>
-                      </div>
-                      <div className="p-2 bg-slate-50 rounded-lg">
-                        <span className="text-[10px] text-slate-400 block uppercase">Marketplace ID</span>
-                        <span className="font-mono font-semibold">{submissionResult.data?.marketplaceId}</span>
-                      </div>
-                    </div>
 
-                    {submissionResult.data?.responseMetadata && (
-                      <div className="p-2.5 bg-slate-900 text-slate-200 rounded-lg text-[10px] font-mono overflow-x-auto">
-                        <span className="text-slate-400 block mb-1">Response Diagnostic Metadata:</span>
-                        <pre>{JSON.stringify(submissionResult.data.responseMetadata, null, 2)}</pre>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div className="p-2 bg-slate-50 rounded-lg">
+                          <span className="text-[10px] text-slate-400 block uppercase">Mode / Outcome</span>
+                          <span className="font-mono font-semibold">
+                            {resData.submissionMode || (resData.isDryRun ? 'DRY_RUN' : 'SANDBOX_SUBMISSION')}
+                            {resData.executionOutcome ? ` (${resData.executionOutcome})` : ''}
+                          </span>
+                        </div>
+                        <div className="p-2 bg-slate-50 rounded-lg">
+                          <span className="text-[10px] text-slate-400 block uppercase">Amazon Submission ID</span>
+                          <span className="font-mono font-semibold truncate block">
+                            {resData.amazonSubmissionId || (resData.isDryRun ? 'DRY-RUN-NO-EXTERNAL-ID' : 'NONE')}
+                          </span>
+                        </div>
+                        <div className="p-2 bg-slate-50 rounded-lg">
+                          <span className="text-[10px] text-slate-400 block uppercase">Seller SKU</span>
+                          <span className="font-mono font-semibold">{resData.sellerSku || resData.sku || '-'}</span>
+                        </div>
+                        <div className="p-2 bg-slate-50 rounded-lg">
+                          <span className="text-[10px] text-slate-400 block uppercase">Marketplace ID</span>
+                          <span className="font-mono font-semibold">{resData.marketplaceId || 'A21TJRUUN4KGV'}</span>
+                        </div>
                       </div>
-                    )}
-                  </div>
-                )}
+
+                      {resData.responseMetadata && (
+                        <div className="p-2.5 bg-slate-900 text-slate-200 rounded-lg text-[10px] font-mono overflow-x-auto">
+                          <span className="text-slate-400 block mb-1">Response Diagnostic Metadata:</span>
+                          <pre>{JSON.stringify(resData.responseMetadata, null, 2)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <div className="flex items-center justify-between pt-4 border-t border-slate-100">
                   <button

@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import DistributedSyncLock from './distributedSyncLock.model.js';
+import { isProductionEnv } from '../../config/storage.js';
 
-// In-memory fallback map for unit tests / offline DB
+// In-memory fallback map strictly for offline dev / unit tests (NEVER used in production)
 export const inMemoryLocksMap = new Map();
 
 const withDbTimeout = (promise, ms = 2000) => {
@@ -94,6 +95,13 @@ export const acquireDistributedLock = async ({
       throw conflictErr;
     }
 
+    if (isProductionEnv()) {
+      const lockErr = new Error('Distributed sync lock store is unavailable in production. Sync aborted safely.');
+      lockErr.code = 'LOCK_SERVICE_UNAVAILABLE';
+      lockErr.status = 503;
+      throw lockErr;
+    }
+
     dbAvailable = false;
   }
 
@@ -169,6 +177,11 @@ export const renewDistributedLock = async (lockHandle, leaseMs = 5 * 60 * 1000) 
     // Document not found with matching lockId: ownership was lost!
     return false;
   } catch (err) {
+    if (isProductionEnv()) {
+      // Fail-closed in production: treat DB failure as lost lock ownership
+      return false;
+    }
+
     dbAvailable = false;
   }
 
@@ -273,8 +286,15 @@ export const isDistributedLockActive = async ({ sellerId, channelId, resource = 
       1500
     );
     if (active) return true;
+    if (isProductionEnv()) return false;
   } catch (err) {
-    // fallback to memory map
+    if (isProductionEnv()) {
+      const lockErr = new Error('Distributed sync lock store is unavailable in production.');
+      lockErr.code = 'LOCK_SERVICE_UNAVAILABLE';
+      lockErr.status = 503;
+      throw lockErr;
+    }
+    // fallback to memory map in non-production
   }
 
   const mem = inMemoryLocksMap.get(lockKey);

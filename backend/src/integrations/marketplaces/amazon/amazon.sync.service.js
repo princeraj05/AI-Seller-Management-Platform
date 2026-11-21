@@ -7,7 +7,14 @@ import { AmazonSpApiClient } from './amazon.client.js';
 import { searchListingsItems, getListingsItem } from './amazon.listings.service.js';
 import { getCatalogItem } from './amazon.catalog.service.js';
 import { mapListingToDbPayload } from './amazon.product.mapper.js';
-import { inMemoryChannelsMap, inMemoryListingsMap, inMemorySyncHistoryMap } from '../../../modules/channels/channel.service.js';
+import {
+  inMemoryChannelsMap,
+  inMemoryListingsMap,
+  inMemorySyncHistoryMap,
+  buildTenantConnectionQuery,
+  matchesTenantStore,
+} from '../../../modules/channels/channel.service.js';
+import { isProductionEnv } from '../../../config/storage.js';
 
 const withDbTimeout = (promise, ms = 2000) => {
   return Promise.race([
@@ -27,20 +34,29 @@ const withDbTimeout = (promise, ms = 2000) => {
  * @returns {Promise<Object>} Sync outcome summary
  */
 export const syncAmazonSellerListingsService = async (tenant, options = {}) => {
-  const { sellerId } = tenant;
+  const { sellerId, storeId = null } = tenant;
   const startedAt = new Date();
 
-  // 1. Verify Amazon connection exists for tenant
+  // 1. Verify Amazon connection exists for tenant (sellerId + storeId scoped)
   let connection = null;
   try {
-    connection = await withDbTimeout(ChannelConnection.findOne({ sellerId, provider: 'AMAZON' }), 1000);
+    const connQuery = buildTenantConnectionQuery(sellerId, 'AMAZON', storeId);
+    connection = await withDbTimeout(ChannelConnection.findOne(connQuery), 1000);
   } catch (err) {
-    // Database buffering or offline: fallback to memory map
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to load Amazon connection from MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+    // Database buffering or offline: fallback to memory map in non-production only
   }
 
-  if (!connection) {
+  if (!connection && !isProductionEnv()) {
     connection = Array.from(inMemoryChannelsMap.values()).find(
-      (c) => c.sellerId?.toString() === sellerId?.toString() && c.provider === 'AMAZON'
+      (c) =>
+        matchesTenantStore(c, { sellerId, storeId }) &&
+        (c.provider === 'AMAZON' || c.channel === 'amazon')
     );
   }
 
@@ -101,13 +117,20 @@ export const syncAmazonSellerListingsService = async (tenant, options = {}) => {
   try {
     syncLog = await SyncHistory.create(syncHistoryData);
   } catch (err) {
-    const id = `sync-${Date.now()}`;
+    if (isProductionEnv()) {
+      const dbErr = new Error('Service Unavailable: Unable to create SyncHistory in MongoDB.');
+      dbErr.code = 'SERVICE_UNAVAILABLE';
+      dbErr.status = 503;
+      throw dbErr;
+    }
+    const id = `sync-${sellerId}-${Date.now()}`;
     syncLog = { _id: id, id, ...syncHistoryData };
     inMemorySyncHistoryMap.set(id, syncLog);
   }
 
-  // 4. Initialize Amazon SP-API Client
+  // 4. Initialize Amazon SP-API Client (tenant-scoped)
   const client = new AmazonSpApiClient({
+    sellerId: sellerId ? sellerId.toString() : null,
     refreshToken: decrypted.refreshToken,
     region,
     marketplaceId,
@@ -245,10 +268,13 @@ export const syncAmazonSellerListingsService = async (tenant, options = {}) => {
             syncStats.totalCreated++;
           }
         } catch (dbErr) {
-          // Memory fallback
-          const id = `list-${listing.sku}`;
-          listingDoc = { _id: id, id, ...dbPayload };
-          inMemoryListingsMap.set(id, listingDoc);
+          if (isProductionEnv()) {
+            throw dbErr;
+          }
+          // Tenant-scoped memory fallback (never global `list-${sku}`)
+          const scopedKey = `${sellerId}:${listing.sku}`;
+          listingDoc = { _id: scopedKey, id: scopedKey, storeId: storeId ? String(storeId) : null, ...dbPayload };
+          inMemoryListingsMap.set(scopedKey, listingDoc);
           syncStats.totalCreated++;
         }
 

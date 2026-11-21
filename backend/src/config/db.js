@@ -13,13 +13,18 @@ try {
 // Disable query buffering so unhandled DB disconnections fail fast with meaningful errors
 mongoose.set('bufferCommands', false);
 
-// Auto-seed default test seller on successful connection if database has no test account
-const ensureDefaultSeller = async () => {
+// Auto-seed default test seller STRICTLY in local development mode (NEVER in production)
+export const ensureDefaultSeller = async (env = process.env) => {
+  const currentEnv = (env.NODE_ENV || 'development').toLowerCase().trim();
+  if (currentEnv !== 'development' || env.DISABLE_DEMO_SEED === 'true') {
+    return { seeded: false, skipped: true, reason: `Skipped in ${currentEnv} environment` };
+  }
+
   try {
     const existing = await User.findOne({ email: 'seller@test.com' });
     if (!existing) {
       await User.create({
-        name: 'Prince Seller',
+        name: 'Dev Seller',
         email: 'seller@test.com',
         password: 'Password@123',
         storeName: 'AI Seller Demo Store',
@@ -27,10 +32,13 @@ const ensureDefaultSeller = async () => {
         isActive: true,
         onboardingCompleted: true,
       });
-      console.log('✨ Seeded default demo seller: seller@test.com / Password@123');
+      console.log('✨ Seeded default development seller account (seller@test.com).');
+      return { seeded: true, skipped: false };
     }
+    return { seeded: false, skipped: false, reason: 'Already exists' };
   } catch (seedErr) {
-    // Non-blocking
+    // Non-blocking in development
+    return { seeded: false, skipped: false, error: seedErr.message };
   }
 };
 
